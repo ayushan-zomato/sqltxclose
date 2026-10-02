@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/ayushanand18/sqltxclose/pkg/sqltxclose"
+	"github.com/ayushan-zomato/sqltxclose/pkg/sqltxclose"
 
 	"golang.org/x/tools/go/analysis/singlechecker"
 )

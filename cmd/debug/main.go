@@ -13,7 +13,7 @@ func main() {
 		Mode: packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 	}
 
-	pkgs, err := packages.Load(cfg, "github.com/ayushanand18/sqltxclose/pkg/sqltxclose/testdata/src/transactions")
+	pkgs, err := packages.Load(cfg, "github.com/ayushan-zomato/sqltxclose/pkg/sqltxclose/testdata/src/transactions")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading packages: %v\n", err)
 		os.Exit(1)

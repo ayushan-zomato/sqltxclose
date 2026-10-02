@@ -1,4 +1,4 @@
-module github.com/ayushanand18/sqltxclose
+module github.com/ayushan-zomato/sqltxclose
 
 go 1.24
 
