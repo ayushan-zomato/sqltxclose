@@ -68,6 +68,62 @@ func goodBranch(db *gorm.DB, condition bool) error {
 	return tx.Rollback().Error
 }
 
+// goodDeferClosure: defer func with named return, closes tx on all paths.
+func goodDeferClosure(db *gorm.DB) (err error) {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			tx.Commit()
+		}
+	}()
+	return doSomething()
+}
+
+// badDeferClosureRecoverOnly: defer only rolls back on panic, not on normal return.
+func badDeferClosureRecoverOnly(db *gorm.DB) (err error) {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+	return nil // want "transaction started here is not guaranteed"
+}
+
+// goodDeferClosureNonNamed: non-named return; defer always closes tx.
+func goodDeferClosureNonNamed(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		tx.Rollback()
+	}()
+	return doSomething()
+}
+
+// badDeferClosurePartialNonNamed: defer only conditionally closes tx, non-named return.
+func badDeferClosurePartialNonNamed(db *gorm.DB, cond bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if cond {
+			tx.Rollback()
+		}
+	}()
+	return nil // want "transaction started here is not guaranteed"
+}
+
 func doSomething() error {
 	return nil
 }

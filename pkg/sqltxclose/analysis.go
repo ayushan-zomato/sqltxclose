@@ -49,7 +49,7 @@ func transactionClosedOnAllPaths(
 		handledReturn := false
 
 		for _, instr := range current.block.Instrs {
-			state = transfer(instr, tx.value, state)
+			state = transfer(instr, tx, state)
 
 			if ret, ok := instr.(*ssa.Return); ok {
 				handledReturn = true
@@ -89,7 +89,7 @@ func transactionClosedOnAllPaths(
 	return token.NoPos, true
 }
 
-func transfer(instr ssa.Instruction, tx ssa.Value, state txState) txState {
+func transfer(instr ssa.Instruction, tx transaction, state txState) txState {
 	switch x := instr.(type) {
 	case *ssa.Call:
 		if isCommitCall(x.Common(), tx) || isRollbackCall(x.Common(), tx) {
@@ -99,12 +99,15 @@ func transfer(instr ssa.Instruction, tx ssa.Value, state txState) txState {
 		if isCommitCall(&x.Call, tx) || isRollbackCall(&x.Call, tx) {
 			return txClosed
 		}
+		if deferredClosureClosesTx(&x.Call, tx) {
+			return txClosed
+		}
 	}
 
 	// Transition when the instruction defines (produces) the tx value —
-	// catches the Extract that yields *sql.Tx from Begin.
+	// catches the Extract that yields *sql.Tx from Begin, or the Begin call for gorm.
 	if state == txNotStarted {
-		if v, ok := instr.(ssa.Value); ok && sameValue(v, tx) {
+		if v, ok := instr.(ssa.Value); ok && sameValue(v, tx.value) {
 			return txOpen
 		}
 	}

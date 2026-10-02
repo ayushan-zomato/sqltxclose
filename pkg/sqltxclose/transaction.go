@@ -1,6 +1,7 @@
 package sqltxclose
 
 import (
+	"go/token"
 	"go/types"
 
 	"golang.org/x/tools/go/ssa"
@@ -54,16 +55,20 @@ func findTransactions(fn *ssa.Function) []transaction {
 					continue
 				}
 				errVal := extractFromTuple(fn, call, 1)
+				txAlloc := findAllocFor(fn, tx)
 				transactions = append(transactions, transaction{
 					value:  tx,
+					alloc:  txAlloc,
 					errVal: errVal,
 					pos:    call.Pos(),
 				})
 
 			case "gorm.io/gorm", "github.com/jinzhu/gorm":
-				errVal := gormErrorValue(fn, call)
+				txAlloc := findAllocFor(fn, call)
+				errVal := gormErrorValue(fn, call, txAlloc)
 				transactions = append(transactions, transaction{
 					value:  call,
+					alloc:  txAlloc,
 					errVal: errVal,
 					pos:    call.Pos(),
 				})
@@ -89,12 +94,16 @@ func extractFromTuple(fn *ssa.Function, call *ssa.Call, index int) ssa.Value {
 }
 
 // gormErrorValue finds the loaded value of tx.Error for a GORM Begin call.
-// SSA pattern: t1 = &t0.Error → t2 = *t1
-func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call) ssa.Value {
+// SSA pattern (direct): t1 = &t0.Error → t2 = *t1
+// SSA pattern (alloc-promoted): t1 = new *DB (tx); *t1 = t0; t3 = *t1; t4 = &t3.Error → t5 = *t4
+func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call, txAlloc ssa.Value) ssa.Value {
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			fa, ok := instr.(*ssa.FieldAddr)
-			if !ok || !sameValue(fa.X, beginCall) {
+			if !ok {
+				continue
+			}
+			if !sameValue(fa.X, beginCall) && !isAllocLoad(fa.X, txAlloc) {
 				continue
 			}
 
@@ -116,6 +125,169 @@ func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call) ssa.Value {
 		}
 	}
 	return nil
+}
+
+// findAllocFor returns the Alloc that directly receives the given value via a Store,
+// or nil if the value is not heap-promoted (e.g. not captured in a closure).
+func findAllocFor(fn *ssa.Function, val ssa.Value) ssa.Value {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok || store.Val != val {
+				continue
+			}
+			if _, ok := store.Addr.(*ssa.Alloc); ok {
+				return store.Addr
+			}
+		}
+	}
+	return nil
+}
+
+// isAllocLoad reports whether v is a pointer-dereference load of alloc (*alloc).
+func isAllocLoad(v ssa.Value, alloc ssa.Value) bool {
+	if alloc == nil {
+		return false
+	}
+	unop, ok := v.(*ssa.UnOp)
+	return ok && unop.Op == token.MUL && unop.X == alloc
+}
+
+// isTxValue reports whether v represents the transaction in the outer function:
+// either the raw Begin result or any load from the heap-promoted alloc.
+func isTxValue(v ssa.Value, tx transaction) bool {
+	if sameValue(v, tx.value) {
+		return true
+	}
+	return isAllocLoad(v, tx.alloc)
+}
+
+// deferredClosureClosesTx returns true when a deferred closure is guaranteed to
+// call Commit or Rollback on tx on every exit path.
+func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction) bool {
+	if call == nil || tx.alloc == nil {
+		return false
+	}
+	closure, ok := call.Value.(*ssa.MakeClosure)
+	if !ok {
+		return false
+	}
+
+	bindingIdx := -1
+	for i, b := range closure.Bindings {
+		if b == tx.alloc {
+			bindingIdx = i
+			break
+		}
+	}
+	if bindingIdx < 0 {
+		return false
+	}
+
+	anonFn, ok := closure.Fn.(*ssa.Function)
+	if !ok || bindingIdx >= len(anonFn.FreeVars) {
+		return false
+	}
+
+	freeVar := anonFn.FreeVars[bindingIdx]
+
+	// Collect every *freeVar load in the closure — these are the tx values inside it.
+	txLoads := make(map[ssa.Value]struct{})
+	for _, block := range anonFn.Blocks {
+		for _, instr := range block.Instrs {
+			if unop, ok := instr.(*ssa.UnOp); ok && unop.Op == token.MUL && unop.X == freeVar {
+				txLoads[unop] = struct{}{}
+			}
+		}
+	}
+
+	return closureClosesTxOnAllPaths(anonFn, txLoads)
+}
+
+// closureClosesTxOnAllPaths performs a BFS over the closure body and returns
+// true only when every exit path calls Commit or Rollback on a tx load.
+func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{}) bool {
+	if len(fn.Blocks) == 0 {
+		return false
+	}
+
+	type item struct {
+		block  *ssa.BasicBlock
+		closed bool
+	}
+	type key struct {
+		block  *ssa.BasicBlock
+		closed bool
+	}
+
+	queue := []item{{block: fn.Blocks[0], closed: false}}
+	visited := make(map[key]struct{})
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		k := key{curr.block, curr.closed}
+		if _, ok := visited[k]; ok {
+			continue
+		}
+		visited[k] = struct{}{}
+
+		closed := curr.closed
+		handledReturn := false
+
+		for _, instr := range curr.block.Instrs {
+			if !closed {
+				if call, ok := instr.(*ssa.Call); ok {
+					if isTxCloseCallOnLoads(call.Common(), txLoads) {
+						closed = true
+					}
+				}
+			}
+			if _, ok := instr.(*ssa.Return); ok {
+				handledReturn = true
+				if !closed {
+					return false
+				}
+			}
+		}
+
+		if !handledReturn && len(curr.block.Succs) == 0 {
+			if !closed {
+				return false
+			}
+			continue
+		}
+
+		for _, succ := range curr.block.Succs {
+			queue = append(queue, item{block: succ, closed: closed})
+		}
+	}
+
+	return true
+}
+
+// isTxCloseCallOnLoads checks whether common calls Commit or Rollback on any value in txLoads.
+func isTxCloseCallOnLoads(common *ssa.CallCommon, txLoads map[ssa.Value]struct{}) bool {
+	if common == nil {
+		return false
+	}
+	fn := common.StaticCallee()
+	if fn == nil || len(common.Args) == 0 {
+		return false
+	}
+	if fn.Name() != "Commit" && fn.Name() != "Rollback" {
+		return false
+	}
+	if _, ok := txLoads[common.Args[0]]; !ok {
+		return false
+	}
+	for pkgPath, info := range txPackages {
+		if isMethodOnPackageType(fn, pkgPath, info.closeType) {
+			return true
+		}
+	}
+	return false
 }
 
 func fieldAddrTypeName(fa *ssa.FieldAddr) string {
@@ -159,15 +331,15 @@ func beginCallPackage(call *ssa.Call) string {
 	return ""
 }
 
-func isCommitCall(common *ssa.CallCommon, tx ssa.Value) bool {
+func isCommitCall(common *ssa.CallCommon, tx transaction) bool {
 	return isCloseCall(common, tx, "Commit")
 }
 
-func isRollbackCall(common *ssa.CallCommon, tx ssa.Value) bool {
+func isRollbackCall(common *ssa.CallCommon, tx transaction) bool {
 	return isCloseCall(common, tx, "Rollback")
 }
 
-func isCloseCall(common *ssa.CallCommon, tx ssa.Value, method string) bool {
+func isCloseCall(common *ssa.CallCommon, tx transaction, method string) bool {
 	if common == nil {
 		return false
 	}
@@ -177,7 +349,7 @@ func isCloseCall(common *ssa.CallCommon, tx ssa.Value, method string) bool {
 		return false
 	}
 
-	if !sameValue(common.Args[0], tx) {
+	if !isTxValue(common.Args[0], tx) {
 		return false
 	}
 
