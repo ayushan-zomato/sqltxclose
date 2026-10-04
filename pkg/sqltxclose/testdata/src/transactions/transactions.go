@@ -130,3 +130,56 @@ func goodLoop(db *sql.DB) error {
 func doSomething() error {
 	return nil
 }
+
+// goodNilGuardNeq: direct nil guard on tx — tx != nil wraps commit.
+func goodNilGuardNeq(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if tx != nil {
+		return tx.Commit()
+	}
+	return nil
+}
+
+// goodNilGuardEq: direct nil guard on tx — tx == nil early return.
+func goodNilGuardEq(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if tx == nil {
+		return nil
+	}
+	return tx.Commit()
+}
+
+// goodDeferNilGuardNeq: nil guard in deferred closure — tx != nil wraps rollback.
+func goodDeferNilGuardNeq(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+	return doSomething()
+}
+
+// goodDeferNilGuardEq: nil guard via early return in deferred closure — tx == nil.
+func goodDeferNilGuardEq(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx == nil {
+			return
+		}
+		tx.Rollback()
+	}()
+	return doSomething()
+}

@@ -259,12 +259,66 @@ func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{})
 			continue
 		}
 
-		for _, succ := range curr.block.Succs {
-			queue = append(queue, item{block: succ, closed: closed})
+		// At a `if txLoad == nil` / `if txLoad != nil` branch, the nil path
+		// means tx is guaranteed nil — nothing to close on that path.
+		if nilBranch, ok := isTxNilBranch(curr.block, txLoads); ok {
+			for i, succ := range curr.block.Succs {
+				c := closed
+				if i == nilBranch {
+					c = true // tx is nil — nothing to close
+				}
+				queue = append(queue, item{block: succ, closed: c})
+			}
+		} else {
+			for _, succ := range curr.block.Succs {
+				queue = append(queue, item{block: succ, closed: closed})
+			}
 		}
 	}
 
 	return true
+}
+
+// isTxNilBranch detects `if txLoad == nil` or `if txLoad != nil` at the end
+// of a closure block, where txLoad is a load of the captured tx variable.
+// Returns (nilBranchIdx, true) where nilBranchIdx is the successor index
+// for the path where tx is guaranteed nil (and thus needs no closing).
+func isTxNilBranch(block *ssa.BasicBlock, txLoads map[ssa.Value]struct{}) (int, bool) {
+	if len(block.Instrs) == 0 || len(block.Succs) != 2 {
+		return 0, false
+	}
+
+	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
+	if !ok {
+		return 0, false
+	}
+
+	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+	if !ok {
+		return 0, false
+	}
+
+	isTxLoad := func(v ssa.Value) bool {
+		_, ok := txLoads[v]
+		return ok
+	}
+	isNil := func(v ssa.Value) bool {
+		c, ok := v.(*ssa.Const)
+		return ok && c.IsNil()
+	}
+
+	if !(isTxLoad(binOp.X) && isNil(binOp.Y)) && !(isTxLoad(binOp.Y) && isNil(binOp.X)) {
+		return 0, false
+	}
+
+	switch binOp.Op {
+	case token.NEQ: // tx != nil → succ[0]=non-nil, succ[1]=nil
+		return 1, true
+	case token.EQL: // tx == nil → succ[0]=nil, succ[1]=non-nil
+		return 0, true
+	default:
+		return 0, false
+	}
 }
 
 // isTxCloseCallOnLoads checks whether common calls Commit or Rollback on any value in txLoads.

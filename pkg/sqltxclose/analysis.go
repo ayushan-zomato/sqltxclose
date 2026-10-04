@@ -79,6 +79,16 @@ func transactionClosedOnAllPaths(
 				}
 				queue = append(queue, analysisState{block: succ, state: s})
 			}
+		} else if nilBranch, ok := isTxValueNilBranch(current.block, tx); ok {
+			// At `if tx == nil` / `if tx != nil`, the nil path means tx is
+			// guaranteed nil — nothing to close, so reset to txNotStarted.
+			for i, succ := range current.block.Succs {
+				s := state
+				if i == nilBranch {
+					s = txNotStarted
+				}
+				queue = append(queue, analysisState{block: succ, state: s})
+			}
 		} else {
 			for _, succ := range current.block.Succs {
 				queue = append(queue, analysisState{block: succ, state: state})
@@ -113,6 +123,46 @@ func transfer(instr ssa.Instruction, tx transaction, state txState) txState {
 	}
 
 	return state
+}
+
+// isTxValueNilBranch detects `if tx == nil` or `if tx != nil` where tx is
+// the tracked transaction value (or a load from its alloc).
+// Returns (nilBranchIdx, true) where nilBranchIdx is the successor index
+// for the path where tx is guaranteed nil.
+func isTxValueNilBranch(block *ssa.BasicBlock, tx transaction) (int, bool) {
+	if len(block.Instrs) == 0 || len(block.Succs) != 2 {
+		return 0, false
+	}
+
+	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
+	if !ok {
+		return 0, false
+	}
+
+	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+	if !ok {
+		return 0, false
+	}
+
+	isNil := func(v ssa.Value) bool {
+		c, ok := v.(*ssa.Const)
+		return ok && c.IsNil()
+	}
+
+	isTx := (isTxValue(binOp.X, tx) && isNil(binOp.Y)) ||
+		(isTxValue(binOp.Y, tx) && isNil(binOp.X))
+	if !isTx {
+		return 0, false
+	}
+
+	switch binOp.Op {
+	case token.NEQ: // tx != nil → succ[0]=non-nil, succ[1]=nil
+		return 1, true
+	case token.EQL: // tx == nil → succ[0]=nil, succ[1]=non-nil
+		return 0, true
+	default:
+		return 0, false
+	}
 }
 
 // isBeginErrorBranch detects `if err != nil` where err is the Begin error.

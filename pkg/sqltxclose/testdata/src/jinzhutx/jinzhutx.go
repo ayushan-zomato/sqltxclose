@@ -127,3 +127,32 @@ func badDeferClosurePartialNonNamed(db *gorm.DB, cond bool) error {
 func doSomething() error {
 	return nil
 }
+
+// goodDeferClosureNilGuardNeq: nil guard in deferred closure — tx != nil wraps close.
+func goodDeferClosureNilGuardNeq(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+	return doSomething()
+}
+
+// goodDeferClosureNilGuardEq: nil guard via early return — tx == nil.
+func goodDeferClosureNilGuardEq(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if tx == nil {
+			return
+		}
+		tx.Rollback()
+	}()
+	return doSomething()
+}
