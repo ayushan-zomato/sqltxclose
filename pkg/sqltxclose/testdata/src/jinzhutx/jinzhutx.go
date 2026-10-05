@@ -156,3 +156,43 @@ func goodDeferClosureNilGuardEq(db *gorm.DB) error {
 	}()
 	return doSomething()
 }
+
+// goodConditionalBegin: tx is only Begin'd when parentTx == nil.
+func goodConditionalBegin(db *gorm.DB, parentTx *gorm.DB) (err error) {
+	var tx *gorm.DB
+	if parentTx == nil {
+		tx = db.Begin()
+	} else {
+		tx = parentTx
+	}
+
+	defer func() {
+		if err != nil {
+			if parentTx == nil {
+				tx.Rollback()
+			}
+		} else {
+			if parentTx == nil {
+				tx.Commit()
+			}
+		}
+	}()
+
+	return doSomething()
+}
+
+// badConditionalBeginNoClose: tx is Begin'd conditionally but closure never closes.
+func badConditionalBeginNoClose(db *gorm.DB, parentTx *gorm.DB) (err error) {
+	var tx *gorm.DB
+	if parentTx == nil {
+		tx = db.Begin()
+	} else {
+		tx = parentTx
+	}
+
+	defer func() {
+		_ = tx
+	}()
+
+	return doSomething() // want "transaction started here is not guaranteed"
+}

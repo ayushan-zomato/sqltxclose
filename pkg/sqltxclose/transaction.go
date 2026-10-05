@@ -56,21 +56,25 @@ func findTransactions(fn *ssa.Function) []transaction {
 				}
 				errVal := extractFromTuple(fn, call, 1)
 				txAlloc := findAllocFor(fn, tx)
+				guardAlloc := findBeginGuard(fn, call)
 				transactions = append(transactions, transaction{
-					value:  tx,
-					alloc:  txAlloc,
-					errVal: errVal,
-					pos:    call.Pos(),
+					value:      tx,
+					alloc:      txAlloc,
+					errVal:     errVal,
+					guardAlloc: guardAlloc,
+					pos:        call.Pos(),
 				})
 
 			case "gorm.io/gorm", "github.com/jinzhu/gorm":
 				txAlloc := findAllocFor(fn, call)
 				errVal := gormErrorValue(fn, call, txAlloc)
+				guardAlloc := findBeginGuard(fn, call)
 				transactions = append(transactions, transaction{
-					value:  call,
-					alloc:  txAlloc,
-					errVal: errVal,
-					pos:    call.Pos(),
+					value:      call,
+					alloc:      txAlloc,
+					errVal:     errVal,
+					guardAlloc: guardAlloc,
+					pos:        call.Pos(),
 				})
 			}
 		}
@@ -144,6 +148,81 @@ func findAllocFor(fn *ssa.Function, val ssa.Value) ssa.Value {
 	return nil
 }
 
+// findBeginGuard detects when a Begin call is conditional on some variable being nil.
+// Pattern: the Begin call sits in a block whose sole predecessor branches on `*alloc == nil`.
+// Returns the alloc that gates the Begin, or nil if Begin is unconditional.
+func findBeginGuard(fn *ssa.Function, beginCall *ssa.Call) ssa.Value {
+	var beginBlock *ssa.BasicBlock
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if instr == beginCall {
+				beginBlock = block
+				break
+			}
+		}
+		if beginBlock != nil {
+			break
+		}
+	}
+	if beginBlock == nil || len(beginBlock.Preds) != 1 {
+		return nil
+	}
+
+	pred := beginBlock.Preds[0]
+	if len(pred.Instrs) == 0 || len(pred.Succs) != 2 {
+		return nil
+	}
+
+	ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+	if !ok {
+		return nil
+	}
+
+	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+	if !ok {
+		return nil
+	}
+
+	isNilConst := func(v ssa.Value) bool {
+		c, ok := v.(*ssa.Const)
+		return ok && c.IsNil()
+	}
+	allocOf := func(v ssa.Value) ssa.Value {
+		unop, ok := v.(*ssa.UnOp)
+		if !ok || unop.Op != token.MUL {
+			return nil
+		}
+		if _, ok := unop.X.(*ssa.Alloc); ok {
+			return unop.X
+		}
+		return nil
+	}
+
+	var guardAlloc ssa.Value
+	if a := allocOf(binOp.X); a != nil && isNilConst(binOp.Y) {
+		guardAlloc = a
+	} else if a := allocOf(binOp.Y); a != nil && isNilConst(binOp.X) {
+		guardAlloc = a
+	}
+	if guardAlloc == nil {
+		return nil
+	}
+
+	// Verify beginBlock is on the "nil" path (guard == nil ⇒ Begin happens).
+	switch binOp.Op {
+	case token.EQL: // guard == nil → succ[0] is the nil path
+		if pred.Succs[0] == beginBlock {
+			return guardAlloc
+		}
+	case token.NEQ: // guard != nil → succ[1] is the nil path
+		if pred.Succs[1] == beginBlock {
+			return guardAlloc
+		}
+	}
+
+	return nil
+}
+
 // isAllocLoad reports whether v is a pointer-dereference load of alloc (*alloc).
 func isAllocLoad(v ssa.Value, alloc ssa.Value) bool {
 	if alloc == nil {
@@ -201,14 +280,39 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction) bool {
 		}
 	}
 
-	return closureClosesTxOnAllPaths(anonFn, txLoads)
+	// Find the guard FreeVar in the closure (if Begin was conditional).
+	var guardFreeVar *ssa.FreeVar
+	if tx.guardAlloc != nil {
+		for i, b := range closure.Bindings {
+			if b == tx.guardAlloc && i < len(anonFn.FreeVars) {
+				guardFreeVar = anonFn.FreeVars[i]
+				break
+			}
+		}
+	}
+
+	return closureClosesTxOnAllPaths(anonFn, txLoads, guardFreeVar)
 }
 
 // closureClosesTxOnAllPaths performs a BFS over the closure body and returns
 // true only when every exit path calls Commit or Rollback on a tx load.
-func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{}) bool {
+// guardFreeVar, when non-nil, is the FreeVar for the conditional-Begin guard;
+// on the "guard non-nil" path Begin never happened, so no close is needed.
+func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{}, guardFreeVar *ssa.FreeVar) bool {
 	if len(fn.Blocks) == 0 {
 		return false
+	}
+
+	// Collect guard loads: every *guardFreeVar in the closure.
+	guardLoads := make(map[ssa.Value]struct{})
+	if guardFreeVar != nil {
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				if unop, ok := instr.(*ssa.UnOp); ok && unop.Op == token.MUL && unop.X == guardFreeVar {
+					guardLoads[unop] = struct{}{}
+				}
+			}
+		}
 	}
 
 	type item struct {
@@ -269,6 +373,16 @@ func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{})
 				}
 				queue = append(queue, item{block: succ, closed: c})
 			}
+		} else if nonNilBranch, ok := isGuardNonNilBranch(curr.block, guardLoads); ok {
+			// At a `if guard == nil` / `if guard != nil` branch, the non-nil
+			// path means Begin never happened — nothing to close.
+			for i, succ := range curr.block.Succs {
+				c := closed
+				if i == nonNilBranch {
+					c = true // guard is non-nil — Begin didn't happen
+				}
+				queue = append(queue, item{block: succ, closed: c})
+			}
 		} else {
 			for _, succ := range curr.block.Succs {
 				queue = append(queue, item{block: succ, closed: closed})
@@ -277,6 +391,47 @@ func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{})
 	}
 
 	return true
+}
+
+// isGuardNonNilBranch detects `if *guard == nil` or `if *guard != nil` where
+// *guard is a load of the Begin-guard FreeVar. Returns the successor index
+// for the path where the guard is non-nil (meaning Begin did NOT happen).
+func isGuardNonNilBranch(block *ssa.BasicBlock, guardLoads map[ssa.Value]struct{}) (int, bool) {
+	if len(guardLoads) == 0 || len(block.Instrs) == 0 || len(block.Succs) != 2 {
+		return 0, false
+	}
+
+	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
+	if !ok {
+		return 0, false
+	}
+
+	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+	if !ok {
+		return 0, false
+	}
+
+	isGuardLoad := func(v ssa.Value) bool {
+		_, ok := guardLoads[v]
+		return ok
+	}
+	isNil := func(v ssa.Value) bool {
+		c, ok := v.(*ssa.Const)
+		return ok && c.IsNil()
+	}
+
+	if !(isGuardLoad(binOp.X) && isNil(binOp.Y)) && !(isGuardLoad(binOp.Y) && isNil(binOp.X)) {
+		return 0, false
+	}
+
+	switch binOp.Op {
+	case token.EQL: // guard == nil → succ[0]=nil (Begin happened), succ[1]=non-nil (no Begin)
+		return 1, true
+	case token.NEQ: // guard != nil → succ[0]=non-nil (no Begin), succ[1]=nil (Begin happened)
+		return 0, true
+	default:
+		return 0, false
+	}
 }
 
 // isTxNilBranch detects `if txLoad == nil` or `if txLoad != nil` at the end

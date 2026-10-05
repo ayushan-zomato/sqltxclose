@@ -16,10 +16,11 @@ var Analyzer = &analysis.Analyzer{
 }
 
 type transaction struct {
-	value  ssa.Value  // The transaction value (Extract index 0 from Begin, or the Begin call for gorm)
-	alloc  ssa.Value  // Non-nil when tx is captured in a closure: the heap-promoted **T alloc
-	errVal ssa.Value  // The error value used for Begin-error branch detection
-	pos    token.Pos
+	value      ssa.Value  // The transaction value (Extract index 0 from Begin, or the Begin call for gorm)
+	alloc      ssa.Value  // Non-nil when tx is captured in a closure: the heap-promoted **T alloc
+	errVal     ssa.Value  // The error value used for Begin-error branch detection
+	guardAlloc ssa.Value  // Non-nil when Begin is conditional (e.g., if parentTx == nil { tx = db.Begin() })
+	pos        token.Pos
 }
 
 func run(pass *analysis.Pass) (any, error) {
