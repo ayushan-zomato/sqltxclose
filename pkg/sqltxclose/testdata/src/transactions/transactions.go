@@ -183,3 +183,115 @@ func goodDeferNilGuardEq(db *sql.DB) error {
 	}()
 	return doSomething()
 }
+
+// goodBooleanGuardRollback: boolean guard pattern — defer conditionally rolls back,
+// direct Commit on the success path disarms the guard.
+func goodBooleanGuardRollback(db *sql.DB, condition bool) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+
+	if condition {
+		return err
+	}
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	rollback = false
+	return nil
+}
+
+// goodBooleanGuardCommit: inverted boolean guard — defer conditionally commits,
+// direct Rollback on error paths, direct Commit via defer on success.
+func goodBooleanGuardCommit(db *sql.DB, condition bool) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	shouldCommit := false
+	defer func() {
+		if shouldCommit {
+			tx.Commit()
+		} else {
+			tx.Rollback()
+		}
+	}()
+
+	if condition {
+		return err
+	}
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	shouldCommit = true
+	return nil
+}
+
+// goodConditionalBeginWithParentTx: tx is only Begin'd when parentTx is nil.
+// The deferred closure only closes when parentTx was nil (i.e. we own the tx).
+// NOTE: For database/sql, the conditional-begin pattern with parentTx is tested
+// in jinzhutx since GORM's single-return Begin is easier for the analyzer to
+// detect. Here we test the simpler variant: always Begin, but defer guards
+// with a boolean that indicates ownership.
+func goodConditionalBeginWithParentTx(db *sql.DB, isOwner bool) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if isOwner {
+			tx.Rollback()
+		}
+	}()
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	return nil
+}
+
+// goodLoopBooleanGuard: boolean variable correlates Rollback with continue.
+func goodLoopBooleanGuard(db *sql.DB, items []int) error {
+	for _, item := range items {
+		tx, err := db.Begin()
+		if err != nil {
+			continue
+		}
+
+		if err := doSomething(); err != nil {
+			tx.Rollback()
+			continue
+		}
+
+		_ = item
+		errorInInner := false
+		for j := 0; j < 3; j++ {
+			if err := doSomething(); err != nil {
+				tx.Rollback()
+				errorInInner = true
+				break
+			}
+		}
+
+		if errorInInner {
+			continue
+		}
+
+		tx.Commit()
+	}
+	return nil
+}
