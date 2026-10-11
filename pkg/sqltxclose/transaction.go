@@ -22,13 +22,13 @@ var txPackages = map[string]struct {
 	"gorm.io/gorm": {
 		beginMethods: []string{"Begin"},
 		beginType:    "DB",
-		closeMethods: []string{"Commit", "Rollback"},
+		closeMethods: []string{"Commit", "Rollback", "RollbackUnlessCommitted"},
 		closeType:    "DB",
 	},
 	"github.com/jinzhu/gorm": {
 		beginMethods: []string{"Begin"},
 		beginType:    "DB",
-		closeMethods: []string{"Commit", "Rollback"},
+		closeMethods: []string{"Commit", "Rollback", "RollbackUnlessCommitted"},
 		closeType:    "DB",
 	},
 }
@@ -67,13 +67,20 @@ func findTransactions(fn *ssa.Function) []transaction {
 
 			case "gorm.io/gorm", "github.com/jinzhu/gorm":
 				txAlloc := findAllocFor(fn, call)
-				errVal := gormErrorValue(fn, call, txAlloc)
+				var fieldBase ssa.Value
+				var fieldIdx int
+				if txAlloc == nil {
+					fieldBase, fieldIdx, _ = findFieldStorage(fn, call)
+				}
+				errVal := gormErrorValue(fn, call, txAlloc, fieldBase, fieldIdx)
 				guardAlloc := findBeginGuard(fn, call)
 				transactions = append(transactions, transaction{
 					value:      call,
 					alloc:      txAlloc,
 					errVal:     errVal,
 					guardAlloc: guardAlloc,
+					fieldBase:  fieldBase,
+					fieldIndex: fieldIdx,
 					pos:        call.Pos(),
 				})
 			}
@@ -100,14 +107,35 @@ func extractFromTuple(fn *ssa.Function, call *ssa.Call, index int) ssa.Value {
 // gormErrorValue finds the loaded value of tx.Error for a GORM Begin call.
 // SSA pattern (direct): t1 = &t0.Error → t2 = *t1
 // SSA pattern (alloc-promoted): t1 = new *DB (tx); *t1 = t0; t3 = *t1; t4 = &t3.Error → t5 = *t4
-func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call, txAlloc ssa.Value) ssa.Value {
+// SSA pattern (field-stored): c.tx = t0; t1 = *(&(*c).tx); t2 = &t1.Error → t3 = *t2
+func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call, txAlloc ssa.Value, fieldBase ssa.Value, fieldIdx int) ssa.Value {
+	isTxSource := func(v ssa.Value) bool {
+		if sameValue(v, beginCall) {
+			return true
+		}
+		if isAllocLoad(v, txAlloc) {
+			return true
+		}
+		if fieldBase != nil {
+			// Check if v is a field load matching the tx field
+			if unop, ok := v.(*ssa.UnOp); ok && unop.Op == token.MUL {
+				if fa, ok := unop.X.(*ssa.FieldAddr); ok && fa.Field == fieldIdx {
+					if sameFieldBase(fa.X, fieldBase) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			fa, ok := instr.(*ssa.FieldAddr)
 			if !ok {
 				continue
 			}
-			if !sameValue(fa.X, beginCall) && !isAllocLoad(fa.X, txAlloc) {
+			if !isTxSource(fa.X) {
 				continue
 			}
 
@@ -143,6 +171,54 @@ func findAllocFor(fn *ssa.Function, val ssa.Value) ssa.Value {
 			if _, ok := store.Addr.(*ssa.Alloc); ok {
 				return store.Addr
 			}
+		}
+	}
+	return nil
+}
+
+// findFieldStorage detects when val is stored to a struct field (e.g. c.tx = db.Begin()).
+// Returns the stable base identity and the field index.
+// SSA pattern: t0 = &base.field; *t0 = val
+// For closure matching we normalize to the deepest stable identity:
+//   - If fa.X is *Alloc (a load from alloc), return the Alloc
+//   - If fa.X is an Alloc directly, return the Alloc
+//   - If fa.X is a Parameter, look for an alloc that stores it (heap promotion),
+//     and return that alloc if found; otherwise return the Parameter.
+func findFieldStorage(fn *ssa.Function, val ssa.Value) (base ssa.Value, fieldIdx int, ok bool) {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, storeOk := instr.(*ssa.Store)
+			if !storeOk || store.Val != val {
+				continue
+			}
+			fa, faOk := store.Addr.(*ssa.FieldAddr)
+			if !faOk {
+				continue
+			}
+			if stable := stableBase(fn, fa.X); stable != nil {
+				return stable, fa.Field, true
+			}
+		}
+	}
+	return nil, 0, false
+}
+
+// stableBase returns the deepest stable SSA identity for a struct pointer.
+// This is used for matching across the outer function and closures.
+func stableBase(fn *ssa.Function, v ssa.Value) ssa.Value {
+	switch v.(type) {
+	case *ssa.Alloc:
+		return v
+	case *ssa.Parameter:
+		// Check if the parameter is heap-promoted (stored to an Alloc).
+		if alloc := findAllocFor(fn, v); alloc != nil {
+			return alloc
+		}
+		return v
+	}
+	if unop, ok := v.(*ssa.UnOp); ok && unop.Op == token.MUL {
+		if _, isAlloc := unop.X.(*ssa.Alloc); isAlloc {
+			return unop.X // the Alloc itself
 		}
 	}
 	return nil
@@ -233,18 +309,69 @@ func isAllocLoad(v ssa.Value, alloc ssa.Value) bool {
 }
 
 // isTxValue reports whether v represents the transaction in the outer function:
-// either the raw Begin result or any load from the heap-promoted alloc.
+// either the raw Begin result, any load from the heap-promoted alloc, or a
+// load from a struct field (c.tx).
 func isTxValue(v ssa.Value, tx transaction) bool {
 	if sameValue(v, tx.value) {
 		return true
 	}
-	return isAllocLoad(v, tx.alloc)
+	if isAllocLoad(v, tx.alloc) {
+		return true
+	}
+	return isFieldLoad(v, tx)
+}
+
+// isFieldLoad reports whether v is a load of the tx field from the struct
+// that holds the transaction. SSA pattern: *(&base.field).
+// The base in the outer function may be the Parameter itself while
+// tx.fieldBase is its heap-promoted Alloc, so we check both direct
+// equality and whether base is stored to tx.fieldBase.
+func isFieldLoad(v ssa.Value, tx transaction) bool {
+	if tx.fieldBase == nil {
+		return false
+	}
+	unop, ok := v.(*ssa.UnOp)
+	if !ok || unop.Op != token.MUL {
+		return false
+	}
+	fa, ok := unop.X.(*ssa.FieldAddr)
+	if !ok || fa.Field != tx.fieldIndex {
+		return false
+	}
+	return sameFieldBase(fa.X, tx.fieldBase)
+}
+
+// sameFieldBase reports whether v resolves to the same stable base identity.
+// Handles: direct equality, v stored to base (Parameter→Alloc heap promotion),
+// or v is *base (a load from the alloc).
+func sameFieldBase(v, base ssa.Value) bool {
+	if v == base {
+		return true
+	}
+	// v is the Parameter, base is the Alloc that stores it.
+	if _, isAlloc := base.(*ssa.Alloc); isAlloc {
+		// Check if v was stored into base.
+		for _, ref := range *v.Referrers() {
+			if store, ok := ref.(*ssa.Store); ok && store.Addr == base && store.Val == v {
+				return true
+			}
+		}
+	}
+	// v is *base (a load from the alloc — used after heap promotion or in closure).
+	if unop, ok := v.(*ssa.UnOp); ok && unop.Op == token.MUL && unop.X == base {
+		return true
+	}
+	return false
 }
 
 // deferredClosureClosesTx returns true when a deferred closure is guaranteed to
-// call Commit or Rollback on tx on every exit path.
-func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction) bool {
-	if call == nil || tx.alloc == nil {
+// close the transaction. It uses a two-tier check:
+//  1. If the closure closes tx on ALL paths (accounting for nil/guard branches), accept.
+//  2. If the closure closes on ANY path AND the outer function also has a direct
+//     (non-deferred) close, accept — the conditional close in the defer is paired
+//     with the direct close (e.g. boolean guard pattern).
+func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClose bool) bool {
+	if call == nil {
 		return false
 	}
 	closure, ok := call.Value.(*ssa.MakeClosure)
@@ -252,32 +379,14 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction) bool {
 		return false
 	}
 
-	bindingIdx := -1
-	for i, b := range closure.Bindings {
-		if b == tx.alloc {
-			bindingIdx = i
-			break
-		}
-	}
-	if bindingIdx < 0 {
-		return false
-	}
-
 	anonFn, ok := closure.Fn.(*ssa.Function)
-	if !ok || bindingIdx >= len(anonFn.FreeVars) {
+	if !ok {
 		return false
 	}
 
-	freeVar := anonFn.FreeVars[bindingIdx]
-
-	// Collect every *freeVar load in the closure — these are the tx values inside it.
-	txLoads := make(map[ssa.Value]struct{})
-	for _, block := range anonFn.Blocks {
-		for _, instr := range block.Instrs {
-			if unop, ok := instr.(*ssa.UnOp); ok && unop.Op == token.MUL && unop.X == freeVar {
-				txLoads[unop] = struct{}{}
-			}
-		}
+	txLoads := collectClosureTxLoads(closure, anonFn, tx)
+	if len(txLoads) == 0 {
+		return false
 	}
 
 	// Find the guard FreeVar in the closure (if Begin was conditional).
@@ -291,7 +400,103 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction) bool {
 		}
 	}
 
-	return closureClosesTxOnAllPaths(anonFn, txLoads, guardFreeVar)
+	// Tier 1: closure closes on ALL paths (nil/guard branches excused).
+	if closureClosesTxOnAllPaths(anonFn, txLoads, guardFreeVar) {
+		return true
+	}
+
+	// Tier 2: closure closes on SOME path, AND the outer function has a direct
+	// close — the boolean guard / commit-then-disarm pattern.
+	if hasDirectClose && closureClosesTxOnAnyPath(anonFn, txLoads) {
+		return true
+	}
+
+	return false
+}
+
+// collectClosureTxLoads finds all SSA values in the closure that represent loads
+// of the transaction. Supports two patterns:
+//   - tx stored to a local alloc (heap-promoted): closure captures the alloc,
+//     loads are *freeVar.
+//   - tx stored to a struct field (c.tx): closure captures the struct pointer's
+//     alloc (fieldBase), loads are *(&(*freeVar).field).
+func collectClosureTxLoads(closure *ssa.MakeClosure, anonFn *ssa.Function, tx transaction) map[ssa.Value]struct{} {
+	txLoads := make(map[ssa.Value]struct{})
+
+	// Case 1: local alloc (heap-promoted tx variable).
+	if tx.alloc != nil {
+		bindingIdx := -1
+		for i, b := range closure.Bindings {
+			if b == tx.alloc {
+				bindingIdx = i
+				break
+			}
+		}
+		if bindingIdx >= 0 && bindingIdx < len(anonFn.FreeVars) {
+			freeVar := anonFn.FreeVars[bindingIdx]
+			for _, block := range anonFn.Blocks {
+				for _, instr := range block.Instrs {
+					if unop, ok := instr.(*ssa.UnOp); ok && unop.Op == token.MUL && unop.X == freeVar {
+						txLoads[unop] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	// Case 2: struct field (c.tx = db.Begin()). The closure captures fieldBase
+	// (the struct pointer — could be a Parameter's heap-promoted Alloc).
+	// Inside the closure, tx is accessed via *(&(*freeVar).fieldIndex).
+	if tx.fieldBase != nil {
+		bindingIdx := -1
+		for i, b := range closure.Bindings {
+			if b == tx.fieldBase {
+				bindingIdx = i
+				break
+			}
+		}
+		if bindingIdx >= 0 && bindingIdx < len(anonFn.FreeVars) {
+			freeVar := anonFn.FreeVars[bindingIdx]
+			for _, block := range anonFn.Blocks {
+				for _, instr := range block.Instrs {
+					// Match: unop = *fa where fa = &base.field, and base
+					// is a load from freeVar (*freeVar).
+					unop, ok := instr.(*ssa.UnOp)
+					if !ok || unop.Op != token.MUL {
+						continue
+					}
+					fa, ok := unop.X.(*ssa.FieldAddr)
+					if !ok || fa.Field != tx.fieldIndex {
+						continue
+					}
+					// fa.X should be *freeVar (a load of the struct pointer from the captured alloc)
+					if load, ok := fa.X.(*ssa.UnOp); ok && load.Op == token.MUL && load.X == freeVar {
+						txLoads[unop] = struct{}{}
+					} else if fa.X == freeVar {
+						// Direct use of freeVar (e.g. when freeVar is already a pointer)
+						txLoads[unop] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	return txLoads
+}
+
+// closureClosesTxOnAnyPath returns true when at least one instruction in the
+// closure body calls Commit or Rollback on a tx load.
+func closureClosesTxOnAnyPath(fn *ssa.Function, txLoads map[ssa.Value]struct{}) bool {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if call, ok := instr.(*ssa.Call); ok {
+				if isTxCloseCallOnLoads(call.Common(), txLoads) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // closureClosesTxOnAllPaths performs a BFS over the closure body and returns
@@ -476,7 +681,7 @@ func isTxNilBranch(block *ssa.BasicBlock, txLoads map[ssa.Value]struct{}) (int, 
 	}
 }
 
-// isTxCloseCallOnLoads checks whether common calls Commit or Rollback on any value in txLoads.
+// isTxCloseCallOnLoads checks whether common calls any recognized close method on any value in txLoads.
 func isTxCloseCallOnLoads(common *ssa.CallCommon, txLoads map[ssa.Value]struct{}) bool {
 	if common == nil {
 		return false
@@ -485,15 +690,17 @@ func isTxCloseCallOnLoads(common *ssa.CallCommon, txLoads map[ssa.Value]struct{}
 	if fn == nil || len(common.Args) == 0 {
 		return false
 	}
-	if fn.Name() != "Commit" && fn.Name() != "Rollback" {
-		return false
-	}
 	if _, ok := txLoads[common.Args[0]]; !ok {
 		return false
 	}
 	for pkgPath, info := range txPackages {
-		if isMethodOnPackageType(fn, pkgPath, info.closeType) {
-			return true
+		if !isMethodOnPackageType(fn, pkgPath, info.closeType) {
+			continue
+		}
+		for _, m := range info.closeMethods {
+			if fn.Name() == m {
+				return true
+			}
 		}
 	}
 	return false
@@ -546,6 +753,32 @@ func isCommitCall(common *ssa.CallCommon, tx transaction) bool {
 
 func isRollbackCall(common *ssa.CallCommon, tx transaction) bool {
 	return isCloseCall(common, tx, "Rollback")
+}
+
+// isAnyCloseCall checks whether common calls any recognized close method
+// (Commit, Rollback, RollbackUnlessCommitted, etc.) on the transaction.
+func isAnyCloseCall(common *ssa.CallCommon, tx transaction) bool {
+	if common == nil {
+		return false
+	}
+	fn := common.StaticCallee()
+	if fn == nil || len(common.Args) == 0 {
+		return false
+	}
+	if !isTxValue(common.Args[0], tx) {
+		return false
+	}
+	for pkgPath, info := range txPackages {
+		if !isMethodOnPackageType(fn, pkgPath, info.closeType) {
+			continue
+		}
+		for _, m := range info.closeMethods {
+			if fn.Name() == m {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isCloseCall(common *ssa.CallCommon, tx transaction, method string) bool {
