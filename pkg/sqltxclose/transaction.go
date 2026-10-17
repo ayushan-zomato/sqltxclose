@@ -1,6 +1,7 @@
 package sqltxclose
 
 import (
+	"go/constant"
 	"go/token"
 	"go/types"
 
@@ -22,11 +23,11 @@ var txPackages = map[string]struct {
 	"gorm.io/gorm": {
 		beginMethods: []string{"Begin"},
 		beginType:    "DB",
-		closeMethods: []string{"Commit", "Rollback", "RollbackUnlessCommitted"},
+		closeMethods: []string{"Commit", "Rollback"},
 		closeType:    "DB",
 	},
 	"github.com/jinzhu/gorm": {
-		beginMethods: []string{"Begin"},
+		beginMethods: []string{"Begin", "BeginTx"},
 		beginType:    "DB",
 		closeMethods: []string{"Commit", "Rollback", "RollbackUnlessCommitted"},
 		closeType:    "DB",
@@ -139,8 +140,13 @@ func gormErrorValue(fn *ssa.Function, beginCall *ssa.Call, txAlloc ssa.Value, fi
 				continue
 			}
 
-			named := fieldAddrTypeName(fa)
-			if named == "" {
+			// Bounds-check: ensure fa.Field is valid for this struct type.
+			ptrType, ok := fa.X.Type().(*types.Pointer)
+			if !ok {
+				continue
+			}
+			st, ok := ptrType.Elem().Underlying().(*types.Struct)
+			if !ok || fa.Field >= st.NumFields() {
 				continue
 			}
 
@@ -350,10 +356,12 @@ func sameFieldBase(v, base ssa.Value) bool {
 	}
 	// v is the Parameter, base is the Alloc that stores it.
 	if _, isAlloc := base.(*ssa.Alloc); isAlloc {
-		// Check if v was stored into base.
-		for _, ref := range *v.Referrers() {
-			if store, ok := ref.(*ssa.Store); ok && store.Addr == base && store.Val == v {
-				return true
+		refs := v.Referrers()
+		if refs != nil {
+			for _, ref := range *refs {
+				if store, ok := ref.(*ssa.Store); ok && store.Addr == base && store.Val == v {
+					return true
+				}
 			}
 		}
 	}
@@ -370,7 +378,12 @@ func sameFieldBase(v, base ssa.Value) bool {
 //  2. If the closure closes on ANY path AND the outer function also has a direct
 //     (non-deferred) close, accept — the conditional close in the defer is paired
 //     with the direct close (e.g. boolean guard pattern).
-func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClose bool) bool {
+//
+// Note: tier-2 is intentionally permissive — it accepts some patterns that are
+// technically unsound (e.g. when the closure condition and the direct-close
+// condition are not complementary). Fixing this properly requires path-correlation
+// analysis across the outer function and the closure. See TODOS.md #2.
+func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClose bool, fn *ssa.Function) bool {
 	if call == nil {
 		return false
 	}
@@ -405,13 +418,101 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClos
 		return true
 	}
 
-	// Tier 2: closure closes on SOME path, AND the outer function has a direct
-	// close — the boolean guard / commit-then-disarm pattern.
-	if hasDirectClose && closureClosesTxOnAnyPath(anonFn, txLoads) {
-		return true
+	// Tier 2: "disarm" pattern — closure conditionally closes via a bool alloc
+	// that is set to false on every direct-close block in the outer function.
+	// e.g.: rollback := true; defer func(){ if rollback { tx.Rollback() } }()
+	//       tx.Commit(); rollback = false  ← disarms the defer on success path
+	// We require: (a) closure condition is a local bool alloc (not a parameter),
+	// (b) every store of false to that alloc co-occurs with a direct close.
+	if closureClosesTxOnAnyPath(anonFn, txLoads) {
+		if boolAlloc := closureDisarmAlloc(closure, anonFn); boolAlloc != nil {
+			if isTier2DisarmSound(fn, boolAlloc, tx) {
+				return true
+			}
+		}
 	}
 
 	return false
+}
+
+// closureDisarmAlloc returns the bool alloc that the closure uses as a guard
+// condition (the "disarm" variable), or nil if no such alloc exists.
+// Only local allocs are accepted — bool parameters are not disarm variables.
+func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.Alloc {
+	for i, b := range closure.Bindings {
+		if i >= len(anonFn.FreeVars) {
+			break
+		}
+		alloc, ok := b.(*ssa.Alloc)
+		if !ok {
+			continue
+		}
+		// Must be a bool alloc (not *error, not *gorm.DB, etc.)
+		ptr, ok := alloc.Type().(*types.Pointer)
+		if !ok {
+			continue
+		}
+		basic, ok := ptr.Elem().(*types.Basic)
+		if !ok || basic.Kind() != types.Bool {
+			continue
+		}
+		// Must be a local alloc (heap-promoted local var), not a promoted parameter.
+		// SSA marks parameter allocs with a non-empty comment starting with the param name.
+		// Local vars initialised in the function body are written before the defer.
+		// We distinguish them by checking: does any block store false to this alloc?
+		// A bool parameter is stored at block 0 with the parameter value and never
+		// stored false by the function itself.
+		if hasFalseStore(anonFn.Parent(), alloc) {
+			return alloc
+		}
+	}
+	return nil
+}
+
+// hasFalseStore reports whether fn contains any store of false to alloc.
+func hasFalseStore(fn *ssa.Function, alloc *ssa.Alloc) bool {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok || store.Addr != alloc {
+				continue
+			}
+			c, ok := store.Val.(*ssa.Const)
+			if !ok {
+				continue
+			}
+			if c.Value != nil && c.Value.Kind() == constant.Bool && !constant.BoolVal(c.Value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isTier2DisarmSound verifies that every store of false to boolAlloc in the
+// outer function co-occurs with a direct close of tx in the same block.
+// This ensures the "disarm" stores are always paired with a close.
+func isTier2DisarmSound(fn *ssa.Function, boolAlloc *ssa.Alloc, tx transaction) bool {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok || store.Addr != boolAlloc {
+				continue
+			}
+			c, ok := store.Val.(*ssa.Const)
+			if !ok {
+				continue
+			}
+			if c.Value == nil || c.Value.Kind() != constant.Bool || constant.BoolVal(c.Value) {
+				continue
+			}
+			// Found a "disarm" (false store). The same block must close the tx.
+			if !blockClosesTx(block, tx) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // collectClosureTxLoads finds all SSA values in the closure that represent loads
@@ -598,87 +699,61 @@ func closureClosesTxOnAllPaths(fn *ssa.Function, txLoads map[ssa.Value]struct{},
 	return true
 }
 
-// isGuardNonNilBranch detects `if *guard == nil` or `if *guard != nil` where
-// *guard is a load of the Begin-guard FreeVar. Returns the successor index
-// for the path where the guard is non-nil (meaning Begin did NOT happen).
-func isGuardNonNilBranch(block *ssa.BasicBlock, guardLoads map[ssa.Value]struct{}) (int, bool) {
-	if len(guardLoads) == 0 || len(block.Instrs) == 0 || len(block.Succs) != 2 {
-		return 0, false
+// nilCompBranchIndex inspects the terminating `if` of block and returns the
+// successor index for the path where the matched value is nil, and the index
+// for the path where it is non-nil.
+// isMember must return true for the SSA value being compared against nil.
+// Returns (nilIdx, nonNilIdx, true) on success, (0, 0, false) otherwise.
+func nilCompBranchIndex(block *ssa.BasicBlock, isMember func(ssa.Value) bool) (nilIdx, nonNilIdx int, ok bool) {
+	if len(block.Instrs) == 0 || len(block.Succs) != 2 {
+		return 0, 0, false
 	}
-
-	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
-	if !ok {
-		return 0, false
+	ifInstr, isIf := block.Instrs[len(block.Instrs)-1].(*ssa.If)
+	if !isIf {
+		return 0, 0, false
 	}
-
-	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-	if !ok {
-		return 0, false
+	binOp, isBinOp := ifInstr.Cond.(*ssa.BinOp)
+	if !isBinOp {
+		return 0, 0, false
 	}
-
-	isGuardLoad := func(v ssa.Value) bool {
-		_, ok := guardLoads[v]
-		return ok
-	}
-	isNil := func(v ssa.Value) bool {
+	isNilConst := func(v ssa.Value) bool {
 		c, ok := v.(*ssa.Const)
 		return ok && c.IsNil()
 	}
-
-	if !(isGuardLoad(binOp.X) && isNil(binOp.Y)) && !(isGuardLoad(binOp.Y) && isNil(binOp.X)) {
-		return 0, false
+	if !(isMember(binOp.X) && isNilConst(binOp.Y)) && !(isMember(binOp.Y) && isNilConst(binOp.X)) {
+		return 0, 0, false
 	}
-
 	switch binOp.Op {
-	case token.EQL: // guard == nil → succ[0]=nil (Begin happened), succ[1]=non-nil (no Begin)
-		return 1, true
-	case token.NEQ: // guard != nil → succ[0]=non-nil (no Begin), succ[1]=nil (Begin happened)
-		return 0, true
+	case token.EQL: // v == nil → succ[0] is the nil path
+		return 0, 1, true
+	case token.NEQ: // v != nil → succ[0] is the non-nil path
+		return 1, 0, true
 	default:
-		return 0, false
+		return 0, 0, false
 	}
 }
 
-// isTxNilBranch detects `if txLoad == nil` or `if txLoad != nil` at the end
-// of a closure block, where txLoad is a load of the captured tx variable.
-// Returns (nilBranchIdx, true) where nilBranchIdx is the successor index
-// for the path where tx is guaranteed nil (and thus needs no closing).
+// isTxNilBranch returns the successor index for the path where the captured tx
+// is nil (no close needed). Uses nilCompBranchIndex.
 func isTxNilBranch(block *ssa.BasicBlock, txLoads map[ssa.Value]struct{}) (int, bool) {
-	if len(block.Instrs) == 0 || len(block.Succs) != 2 {
+	nilIdx, _, ok := nilCompBranchIndex(block, func(v ssa.Value) bool {
+		_, is := txLoads[v]
+		return is
+	})
+	return nilIdx, ok
+}
+
+// isGuardNonNilBranch returns the successor index for the path where the
+// Begin-guard is non-nil (meaning Begin did NOT happen, so no close needed).
+func isGuardNonNilBranch(block *ssa.BasicBlock, guardLoads map[ssa.Value]struct{}) (int, bool) {
+	if len(guardLoads) == 0 {
 		return 0, false
 	}
-
-	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
-	if !ok {
-		return 0, false
-	}
-
-	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-	if !ok {
-		return 0, false
-	}
-
-	isTxLoad := func(v ssa.Value) bool {
-		_, ok := txLoads[v]
-		return ok
-	}
-	isNil := func(v ssa.Value) bool {
-		c, ok := v.(*ssa.Const)
-		return ok && c.IsNil()
-	}
-
-	if !(isTxLoad(binOp.X) && isNil(binOp.Y)) && !(isTxLoad(binOp.Y) && isNil(binOp.X)) {
-		return 0, false
-	}
-
-	switch binOp.Op {
-	case token.NEQ: // tx != nil → succ[0]=non-nil, succ[1]=nil
-		return 1, true
-	case token.EQL: // tx == nil → succ[0]=nil, succ[1]=non-nil
-		return 0, true
-	default:
-		return 0, false
-	}
+	_, nonNilIdx, ok := nilCompBranchIndex(block, func(v ssa.Value) bool {
+		_, is := guardLoads[v]
+		return is
+	})
+	return nonNilIdx, ok
 }
 
 // isTxCloseCallOnLoads checks whether common calls any recognized close method on any value in txLoads.
@@ -706,95 +781,100 @@ func isTxCloseCallOnLoads(common *ssa.CallCommon, txLoads map[ssa.Value]struct{}
 	return false
 }
 
-func fieldAddrTypeName(fa *ssa.FieldAddr) string {
-	ptrType, ok := fa.X.Type().(*types.Pointer)
-	if !ok {
-		return ""
-	}
-	st, ok := ptrType.Elem().Underlying().(*types.Struct)
-	if !ok {
-		return ""
-	}
-	if fa.Field >= st.NumFields() {
-		return ""
-	}
-	return st.Field(fa.Field).Name()
-}
 
 // beginCallPackage returns the package path if the call is a Begin/BeginTx on a recognised type.
+// Handles both static calls (StaticCallee != nil) and interface dispatch (IsInvoke).
 func beginCallPackage(call *ssa.Call) string {
 	common := call.Common()
 	if common == nil {
 		return ""
 	}
 
-	fn := common.StaticCallee()
-	if fn == nil {
+	// Static call: Begin on a concrete type.
+	if fn := common.StaticCallee(); fn != nil {
+		for pkgPath, info := range txPackages {
+			if !isMethodOnPackageType(fn, pkgPath, info.beginType) {
+				continue
+			}
+			for _, m := range info.beginMethods {
+				if fn.Name() == m {
+					return pkgPath
+				}
+			}
+		}
 		return ""
 	}
 
-	for pkgPath, info := range txPackages {
-		if !isMethodOnPackageType(fn, pkgPath, info.beginType) {
-			continue
-		}
-		for _, m := range info.beginMethods {
-			if fn.Name() == m {
-				return pkgPath
-			}
-		}
+	// Interface dispatch: Begin called through an interface value.
+	if common.IsInvoke() && common.Method != nil {
+		return beginMethodPackageFromReturnType(common.Method)
 	}
 
 	return ""
 }
 
-func isCommitCall(common *ssa.CallCommon, tx transaction) bool {
-	return isCloseCall(common, tx, "Commit")
-}
+// beginMethodPackageFromReturnType checks whether method is a Begin/BeginTx
+// whose return type is a recognised transaction type. Returns the package path
+// or "" if not recognised.
+func beginMethodPackageFromReturnType(method *types.Func) string {
+	sig, ok := method.Type().(*types.Signature)
+	if !ok || sig.Results().Len() == 0 {
+		return ""
+	}
 
-func isRollbackCall(common *ssa.CallCommon, tx transaction) bool {
-	return isCloseCall(common, tx, "Rollback")
+	for pkgPath, info := range txPackages {
+		for _, m := range info.beginMethods {
+			if method.Name() != m {
+				continue
+			}
+			// Check that the first result type is *pkgPath.closeType.
+			result := sig.Results().At(0).Type()
+			if ptr, ok := result.(*types.Pointer); ok {
+				result = ptr.Elem()
+			}
+			named, ok := result.(*types.Named)
+			if !ok {
+				continue
+			}
+			obj := named.Obj()
+			if obj.Pkg() != nil && obj.Pkg().Path() == pkgPath && obj.Name() == info.closeType {
+				return pkgPath
+			}
+		}
+	}
+	return ""
 }
 
 // isAnyCloseCall checks whether common calls any recognized close method
 // (Commit, Rollback, RollbackUnlessCommitted, etc.) on the transaction.
+// Handles both static calls and bound method-value calls (f := tx.Commit; f()).
 func isAnyCloseCall(common *ssa.CallCommon, tx transaction) bool {
 	if common == nil {
 		return false
 	}
-	fn := common.StaticCallee()
-	if fn == nil || len(common.Args) == 0 {
-		return false
-	}
-	if !isTxValue(common.Args[0], tx) {
-		return false
-	}
-	for pkgPath, info := range txPackages {
-		if !isMethodOnPackageType(fn, pkgPath, info.closeType) {
-			continue
-		}
-		for _, m := range info.closeMethods {
-			if fn.Name() == m {
-				return true
-			}
+
+	// Static method call: tx.Commit() / tx.Rollback()
+	// Args[0] is the receiver for direct static calls.
+	if fn := common.StaticCallee(); fn != nil {
+		if isCloseMethod(fn) && len(common.Args) > 0 && isTxValue(common.Args[0], tx) {
+			return true
 		}
 	}
+
+	// Bound method-value call: f := tx.Commit; f()
+	// SSA: MakeClosure{Fn: Commit$bound, Bindings: [receiver]}
+	// The thunk has no receiver in its signature — check by name and binding type.
+	if closure, ok := common.Value.(*ssa.MakeClosure); ok {
+		if isBoundCloseThunk(closure, tx) {
+			return true
+		}
+	}
+
 	return false
 }
 
-func isCloseCall(common *ssa.CallCommon, tx transaction, method string) bool {
-	if common == nil {
-		return false
-	}
-
-	fn := common.StaticCallee()
-	if fn == nil || fn.Name() != method || len(common.Args) == 0 {
-		return false
-	}
-
-	if !isTxValue(common.Args[0], tx) {
-		return false
-	}
-
+// isCloseMethod reports whether fn is a recognized close method on any tracked type.
+func isCloseMethod(fn *ssa.Function) bool {
 	for pkgPath, info := range txPackages {
 		if !isMethodOnPackageType(fn, pkgPath, info.closeType) {
 			continue
@@ -805,7 +885,6 @@ func isCloseCall(common *ssa.CallCommon, tx transaction, method string) bool {
 			}
 		}
 	}
-
 	return false
 }
 
@@ -816,18 +895,11 @@ func isMethodOnPackageType(fn *ssa.Function, pkgPath, typeName string) bool {
 	}
 
 	sig := fn.Signature
-	if sig == nil {
+	if sig == nil || sig.Recv() == nil {
 		return false
 	}
 
-	recv := sig.Recv()
-	if recv == nil {
-		// Could be a package-level function (e.g. (*sql.DB).Begin is a method).
-		// Check via package.
-		return fn.Pkg != nil && fn.Pkg.Pkg != nil && fn.Pkg.Pkg.Path() == pkgPath
-	}
-
-	recvType := recv.Type()
+	recvType := sig.Recv().Type()
 	if ptr, ok := recvType.(*types.Pointer); ok {
 		recvType = ptr.Elem()
 	}
@@ -843,4 +915,30 @@ func isMethodOnPackageType(fn *ssa.Function, pkgPath, typeName string) bool {
 
 func sameValue(a, b ssa.Value) bool {
 	return a != nil && b != nil && a == b
+}
+
+// isBoundCloseThunk detects a bound method-value call to a close method.
+// SSA represents f := tx.Commit as MakeClosure{Fn: "Commit$bound", Bindings: [tx]}.
+// The thunk has no receiver in its signature, so we match by name suffix and
+// verify the binding (the captured receiver) is the tracked transaction.
+func isBoundCloseThunk(closure *ssa.MakeClosure, tx transaction) bool {
+	boundFn, ok := closure.Fn.(*ssa.Function)
+	if !ok || len(closure.Bindings) == 0 {
+		return false
+	}
+	name := boundFn.Name()
+	// Thunk name pattern: "<MethodName>$bound"
+	const suffix = "$bound"
+	if len(name) <= len(suffix) || name[len(name)-len(suffix):] != suffix {
+		return false
+	}
+	methodName := name[:len(name)-len(suffix)]
+	for _, info := range txPackages {
+		for _, m := range info.closeMethods {
+			if methodName == m && isTxValue(closure.Bindings[0], tx) {
+				return true
+			}
+		}
+	}
+	return false
 }

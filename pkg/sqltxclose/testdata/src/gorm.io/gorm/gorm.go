@@ -16,6 +16,3 @@ func (db *DB) Rollback() *DB {
 	return &DB{}
 }
 
-func (db *DB) RollbackUnlessCommitted() *DB {
-	return &DB{}
-}

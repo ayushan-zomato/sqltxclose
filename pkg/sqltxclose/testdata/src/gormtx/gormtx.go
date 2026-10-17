@@ -72,27 +72,3 @@ func doSomething() error {
 	return nil
 }
 
-// goodDeferRollbackUnlessCommitted: RollbackUnlessCommitted is a valid close.
-func goodDeferRollbackUnlessCommitted(db *gorm.DB) error {
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	if err := doSomething(); err != nil {
-		return err
-	}
-	return tx.Commit().Error
-}
-
-// goodDeferRollbackUnlessCommittedNoCommit: RollbackUnlessCommitted alone is sufficient.
-func goodDeferRollbackUnlessCommittedNoCommit(db *gorm.DB) error {
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	return doSomething()
-}

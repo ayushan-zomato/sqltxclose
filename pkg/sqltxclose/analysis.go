@@ -71,22 +71,23 @@ func transactionClosedOnAllPaths(
 		handledReturn := false
 
 		for _, instr := range current.block.Instrs {
-			state = transfer(instr, tx, state, directClose)
+			state = transfer(instr, tx, state, directClose, fn)
 
 			if ret, ok := instr.(*ssa.Return); ok {
 				handledReturn = true
 				if state == txOpen {
-					return ret.Pos(), false
+					pos := ret.Pos()
+					if !pos.IsValid() {
+						pos = tx.pos
+					}
+					return pos, false
 				}
 			}
 		}
 
 		if !handledReturn && len(current.block.Succs) == 0 {
 			if state == txOpen {
-				if len(current.block.Instrs) > 0 {
-					return current.block.Instrs[len(current.block.Instrs)-1].Pos(), false
-				}
-				return token.NoPos, false
+				return tx.pos, false
 			}
 			continue
 		}
@@ -132,7 +133,7 @@ func transactionClosedOnAllPaths(
 	return token.NoPos, true
 }
 
-func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClose bool) txState {
+func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClose bool, fn *ssa.Function) txState {
 	switch x := instr.(type) {
 	case *ssa.Call:
 		if isAnyCloseCall(x.Common(), tx) {
@@ -142,7 +143,7 @@ func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClo
 		if isAnyCloseCall(&x.Call, tx) {
 			return txClosed
 		}
-		if deferredClosureClosesTx(&x.Call, tx, hasDirectClose) {
+		if deferredClosureClosesTx(&x.Call, tx, hasDirectClose, fn) {
 			return txClosed
 		}
 	}
@@ -166,44 +167,13 @@ func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClo
 	return state
 }
 
-// isTxValueNilBranch detects `if tx == nil` or `if tx != nil` where tx is
-// the tracked transaction value (or a load from its alloc).
-// Returns (nilBranchIdx, true) where nilBranchIdx is the successor index
-// for the path where tx is guaranteed nil.
+// isTxValueNilBranch detects `if tx == nil` / `if tx != nil` on the tracked
+// transaction value. Returns the successor index for the nil path.
 func isTxValueNilBranch(block *ssa.BasicBlock, tx transaction) (int, bool) {
-	if len(block.Instrs) == 0 || len(block.Succs) != 2 {
-		return 0, false
-	}
-
-	ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If)
-	if !ok {
-		return 0, false
-	}
-
-	binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-	if !ok {
-		return 0, false
-	}
-
-	isNil := func(v ssa.Value) bool {
-		c, ok := v.(*ssa.Const)
-		return ok && c.IsNil()
-	}
-
-	isTx := (isTxValue(binOp.X, tx) && isNil(binOp.Y)) ||
-		(isTxValue(binOp.Y, tx) && isNil(binOp.X))
-	if !isTx {
-		return 0, false
-	}
-
-	switch binOp.Op {
-	case token.NEQ: // tx != nil → succ[0]=non-nil, succ[1]=nil
-		return 1, true
-	case token.EQL: // tx == nil → succ[0]=nil, succ[1]=non-nil
-		return 0, true
-	default:
-		return 0, false
-	}
+	nilIdx, _, ok := nilCompBranchIndex(block, func(v ssa.Value) bool {
+		return isTxValue(v, tx)
+	})
+	return nilIdx, ok
 }
 
 // isBeginErrorBranch detects `if err != nil` where err is the Begin error.
@@ -363,16 +333,18 @@ func findTrueStoreBlocks(fn *ssa.Function, alloc *ssa.Alloc) []*ssa.BasicBlock {
 			if !ok || store.Addr != alloc {
 				continue
 			}
-			c, ok := store.Val.(*ssa.Const)
-			if !ok {
-				continue
-			}
-			if c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value) {
+			if isConstTrue(store.Val) {
 				blocks = append(blocks, block)
 			}
 		}
 	}
 	return blocks
+}
+
+// isConstTrue reports whether v is a boolean SSA constant with value true.
+func isConstTrue(v ssa.Value) bool {
+	c, ok := v.(*ssa.Const)
+	return ok && c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value)
 }
 
 // blockClosesTx returns true if the block contains a direct close call on tx.
@@ -396,11 +368,7 @@ func findPhiTrueEdgeBlocks(phi *ssa.Phi) []*ssa.BasicBlock {
 	phiBlock := phi.Block()
 	var blocks []*ssa.BasicBlock
 	for i, edge := range phi.Edges {
-		c, ok := edge.(*ssa.Const)
-		if !ok {
-			continue
-		}
-		if c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value) {
+		if isConstTrue(edge) {
 			if i < len(phiBlock.Preds) {
 				blocks = append(blocks, phiBlock.Preds[i])
 			}
@@ -432,9 +400,10 @@ func blockOrPredClosesTx(block *ssa.BasicBlock, tx transaction) bool {
 	}
 	return false
 }
-// is a load (*alloc) from an alloc that received errVal via a Store.
-// This handles the `err = tx.Error; if err != nil` pattern where the named
-// return variable is heap-promoted.
+// isErrValue reports whether v represents the Begin error: either directly
+// (v == errVal) or as a load from an alloc that was stored with errVal.
+// The latter handles `err = tx.Error; if err != nil` where the named-return
+// variable is heap-promoted to an alloc.
 func isErrValue(v, errVal ssa.Value, fn *ssa.Function) bool {
 	if sameValue(v, errVal) {
 		return true

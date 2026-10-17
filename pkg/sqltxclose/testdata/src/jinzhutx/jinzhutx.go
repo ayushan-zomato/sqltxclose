@@ -7,7 +7,6 @@ func goodCommit(db *gorm.DB) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	return tx.Commit().Error
 }
 
@@ -16,7 +15,6 @@ func goodRollback(db *gorm.DB) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	return tx.Rollback().Error
 }
 
@@ -25,9 +23,7 @@ func goodDefer(db *gorm.DB) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	defer tx.Rollback()
-
 	return doSomething()
 }
 
@@ -36,9 +32,7 @@ func bad(db *gorm.DB) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	_ = tx
-
 	return nil // want "transaction started here is not guaranteed"
 }
 
@@ -47,11 +41,9 @@ func badBranch(db *gorm.DB, condition bool) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	if condition {
 		return tx.Commit().Error
 	}
-
 	return nil // want "transaction started here is not guaranteed"
 }
 
@@ -60,15 +52,13 @@ func goodBranch(db *gorm.DB, condition bool) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-
 	if condition {
 		return tx.Commit().Error
 	}
-
 	return tx.Rollback().Error
 }
 
-// goodDeferClosure: defer func with named return, closes tx on all paths.
+// goodDeferClosure: named return; defer commits or rolls back based on err.
 func goodDeferClosure(db *gorm.DB) (err error) {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -84,7 +74,7 @@ func goodDeferClosure(db *gorm.DB) (err error) {
 	return doSomething()
 }
 
-// badDeferClosureRecoverOnly: defer only rolls back on panic, not on normal return.
+// badDeferClosureRecoverOnly: defer only runs on panic, not on normal return.
 func badDeferClosureRecoverOnly(db *gorm.DB) (err error) {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -98,7 +88,6 @@ func badDeferClosureRecoverOnly(db *gorm.DB) (err error) {
 	return nil // want "transaction started here is not guaranteed"
 }
 
-// goodDeferClosureNonNamed: non-named return; defer always closes tx.
 func goodDeferClosureNonNamed(db *gorm.DB) error {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -110,7 +99,7 @@ func goodDeferClosureNonNamed(db *gorm.DB) error {
 	return doSomething()
 }
 
-// badDeferClosurePartialNonNamed: defer only conditionally closes tx, non-named return.
+// badDeferClosurePartialNonNamed: defer only conditionally closes tx.
 func badDeferClosurePartialNonNamed(db *gorm.DB, cond bool) error {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -128,7 +117,6 @@ func doSomething() error {
 	return nil
 }
 
-// goodDeferClosureNilGuardNeq: nil guard in deferred closure — tx != nil wraps close.
 func goodDeferClosureNilGuardNeq(db *gorm.DB) error {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -142,7 +130,6 @@ func goodDeferClosureNilGuardNeq(db *gorm.DB) error {
 	return doSomething()
 }
 
-// goodDeferClosureNilGuardEq: nil guard via early return — tx == nil.
 func goodDeferClosureNilGuardEq(db *gorm.DB) error {
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -157,7 +144,6 @@ func goodDeferClosureNilGuardEq(db *gorm.DB) error {
 	return doSomething()
 }
 
-// goodConditionalBegin: tx is only Begin'd when parentTx == nil.
 func goodConditionalBegin(db *gorm.DB, parentTx *gorm.DB) (err error) {
 	var tx *gorm.DB
 	if parentTx == nil {
@@ -165,7 +151,6 @@ func goodConditionalBegin(db *gorm.DB, parentTx *gorm.DB) (err error) {
 	} else {
 		tx = parentTx
 	}
-
 	defer func() {
 		if err != nil {
 			if parentTx == nil {
@@ -177,11 +162,9 @@ func goodConditionalBegin(db *gorm.DB, parentTx *gorm.DB) (err error) {
 			}
 		}
 	}()
-
 	return doSomething()
 }
 
-// badConditionalBeginNoClose: tx is Begin'd conditionally but closure never closes.
 func badConditionalBeginNoClose(db *gorm.DB, parentTx *gorm.DB) (err error) {
 	var tx *gorm.DB
 	if parentTx == nil {
@@ -189,23 +172,20 @@ func badConditionalBeginNoClose(db *gorm.DB, parentTx *gorm.DB) (err error) {
 	} else {
 		tx = parentTx
 	}
-
 	defer func() {
 		_ = tx
 	}()
-
 	return doSomething() // want "transaction started here is not guaranteed"
 }
 
-// goodDeferClosureNamedReturnCommitAndRollback: defer func with named return err,
-// rolls back on error, commits on success, with additional logic after commit.
+// goodDeferClosureNamedReturnCommitAndRollback: named return; defer rolls back
+// on error, commits on success, then does post-commit work.
 func goodDeferClosureNamedReturnCommitAndRollback(db *gorm.DB) (err error) {
 	tx := db.Begin()
-	_ = "some intermediate work" // code between Begin and error check
+	_ = "some intermediate work"
 	if err = tx.Error; err != nil {
 		return err
 	}
-
 	defer func() {
 		if err != nil {
 			tx.Rollback()
@@ -214,103 +194,84 @@ func goodDeferClosureNamedReturnCommitAndRollback(db *gorm.DB) (err error) {
 		if err = tx.Commit().Error; err != nil {
 			return
 		}
-		// additional work after commit (e.g. dynamo write)
 		_ = "post-commit work"
 	}()
-
 	return doSomething()
 }
 
-// goodDeferClosureNamedReturnRollbackOnly: defer func with named return,
-// only rolls back on error — commit is done directly in the function body.
+// goodDeferClosureNamedReturnRollbackOnly: defer rolls back on error;
+// commit is done directly in the function body.
 func goodDeferClosureNamedReturnRollbackOnly(db *gorm.DB) (err error) {
 	tx := db.Begin()
 	if err = tx.Error; err != nil {
 		return err
 	}
-
 	defer func() {
 		if err != nil {
 			tx.Rollback()
 		}
 	}()
-
 	if err = doSomething(); err != nil {
 		return err
 	}
-
 	return tx.Commit().Error
 }
 
-// goodDeferClosureMultipleReturnsInClosure: defer func with multiple return
-// points inside the closure — some close, some don't (early returns after close).
+// goodDeferClosureMultipleReturnsInClosure: multiple return points inside the
+// closure, all paths after open have a close.
 func goodDeferClosureMultipleReturnsInClosure(db *gorm.DB) (err error) {
 	tx := db.Begin()
 	if err = tx.Error; err != nil {
 		return err
 	}
-
 	defer func() {
 		if err != nil {
 			tx.Rollback()
 			return
 		}
 		if err = tx.Commit().Error; err != nil {
-			// commit failed — already handled by commit call itself
 			return
 		}
 		if err = doSomething(); err != nil {
-			// post-commit work failed
 			return
 		}
 	}()
-
 	return doSomething()
 }
 
-// goodDeferRollbackUnlessCommitted: RollbackUnlessCommitted is a valid close — covers
-// both commit and rollback in a single call.
 func goodDeferRollbackUnlessCommitted(db *gorm.DB) error {
 	tx := db.Begin()
 	if tx.Error != nil {
 		return tx.Error
 	}
 	defer tx.RollbackUnlessCommitted()
-
 	if err := doSomething(); err != nil {
 		return err
 	}
 	return tx.Commit().Error
 }
 
-// goodDeferRollbackUnlessCommittedNoCommit: RollbackUnlessCommitted alone is
-// sufficient — it rolls back if no commit happened.
 func goodDeferRollbackUnlessCommittedNoCommit(db *gorm.DB) error {
 	tx := db.Begin()
 	if tx.Error != nil {
 		return tx.Error
 	}
 	defer tx.RollbackUnlessCommitted()
-
 	return doSomething()
 }
 
-// goodLoopBooleanGuard: tx created inside a loop, all error paths
-// rollback+continue/break, success path commits. The boolean variable
-// `errorInInner` is only set to true in blocks that also call Rollback,
-// so the `if errorInInner { continue }` branch is recognized as tx-closed.
+// goodLoopBooleanGuard: tx created per iteration; all error paths rollback,
+// success path commits. errorInInner guards the continue after a rollback.
 func goodLoopBooleanGuard(db *gorm.DB, items []int) error {
 	for _, item := range items {
 		tx := db.Begin()
 		if tx.Error != nil {
 			continue
 		}
-
 		if err := doSomething(); err != nil {
 			tx.Rollback()
 			continue
 		}
-
 		_ = item
 		errorInInner := false
 		for j := 0; j < 3; j++ {
@@ -320,11 +281,9 @@ func goodLoopBooleanGuard(db *gorm.DB, items []int) error {
 				break
 			}
 		}
-
 		if errorInInner {
 			continue
 		}
-
 		tx.Commit()
 	}
 	return nil
@@ -335,43 +294,33 @@ type controller struct {
 	rollBack bool
 }
 
-// goodStructFieldBoolGuardWithExtraLogic: tx and rollback flag on struct fields,
-// defer has additional non-tx logic (e.g. lock release) before the close check.
 func (c *controller) goodStructFieldBoolGuardWithExtraLogic(db *gorm.DB) error {
 	c.tx = db.Begin()
 	c.rollBack = true
 	if c.tx.Error != nil {
 		return c.tx.Error
 	}
-
 	defer func() {
-		// extra non-tx work in the defer (e.g. lock release)
 		_ = "releasing lock"
-
 		if c.rollBack {
 			c.tx.Rollback()
 		} else {
 			c.tx.Commit()
 		}
 	}()
-
 	if err := doSomething(); err != nil {
 		return err
 	}
-
 	c.rollBack = false
 	return nil
 }
 
-// goodStructFieldBoolGuardSimple: tx and rollback flag on struct fields,
-// defer branches between Rollback and Commit based on the flag.
 func (c *controller) goodStructFieldBoolGuardSimple(db *gorm.DB) error {
 	c.tx = db.Begin()
 	c.rollBack = true
 	if c.tx.Error != nil {
 		return c.tx.Error
 	}
-
 	defer func() {
 		if c.rollBack {
 			c.tx.Rollback()
@@ -379,11 +328,9 @@ func (c *controller) goodStructFieldBoolGuardSimple(db *gorm.DB) error {
 			c.tx.Commit()
 		}
 	}()
-
 	if err := doSomething(); err != nil {
 		return err
 	}
-
 	c.rollBack = false
 	return nil
 }
@@ -395,8 +342,7 @@ type txBuilder struct {
 	err error
 }
 
-// beginTx starts a transaction and stores it on the struct field.
-// This should NOT be flagged — closing is delegated to the caller.
+// beginTx starts a transaction on the struct; closing is delegated to the caller.
 func (b *txBuilder) beginTx(db *gorm.DB) *txBuilder {
 	b.tx = db.Begin()
 	if b.tx.Error != nil {
@@ -405,7 +351,6 @@ func (b *txBuilder) beginTx(db *gorm.DB) *txBuilder {
 	return b
 }
 
-// goodCallerClosesField: caller begins tx via method, closes via defer + commit.
 func goodCallerClosesField(db *gorm.DB) error {
 	b := &txBuilder{}
 	b.beginTx(db)
@@ -419,8 +364,6 @@ func goodCallerClosesField(db *gorm.DB) error {
 	return b.tx.Commit().Error
 }
 
-// goodCallerClosesViaChain: method chain — beginTx returns the builder,
-// caller uses it to close.
 func goodCallerClosesViaChain(db *gorm.DB) error {
 	b := (&txBuilder{}).beginTx(db)
 	if b.err != nil {
@@ -430,7 +373,6 @@ func goodCallerClosesViaChain(db *gorm.DB) error {
 	return b.tx.Commit().Error
 }
 
-// badCallerNeverCloses: caller starts tx via method but never closes it.
 func badCallerNeverCloses(db *gorm.DB) error {
 	b := &txBuilder{}
 	b.beginTx(db)
@@ -439,4 +381,176 @@ func badCallerNeverCloses(db *gorm.DB) error {
 	}
 	_ = b.tx
 	return nil // want "transaction opened via beginTx is not closed on all paths"
+}
+
+// ── BeginTx (false-negative, issue #3) ──
+// BeginTx is not in jinzhu's beginMethods yet; these cases document the gap.
+
+func badBeginTxNoClose(db *gorm.DB) error {
+	tx := db.BeginTx(nil, nil)
+	if tx.Error != nil {
+		return tx.Error
+	}
+	_ = tx
+	return nil // want "transaction started here is not guaranteed"
+}
+
+func badBeginTxBranch(db *gorm.DB, condition bool) error {
+	tx := db.BeginTx(nil, nil)
+	if tx.Error != nil {
+		return tx.Error
+	}
+	if condition {
+		return tx.Commit().Error
+	}
+	return nil // want "transaction started here is not guaranteed"
+}
+
+func goodBeginTxDefer(db *gorm.DB) error {
+	tx := db.BeginTx(nil, nil)
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer tx.Rollback()
+	return doSomething()
+}
+// ── Regression: nil-Referrers panic (issue #1) ──
+// A package-level var whose first field sits at the same index as svc.tx used
+// to trigger a nil dereference in sameFieldBase when calling v.Referrers().
+
+var gStats struct {
+	tx   *gorm.DB
+	hits int
+}
+
+type svc struct {
+	tx *gorm.DB
+}
+
+// regressionNilReferrers must not crash. defer closes s.tx on every path.
+func (s *svc) regressionNilReferrers(db *gorm.DB) error {
+	s.tx = db.Begin()
+	defer func() { s.tx.Rollback() }()
+	gStats.tx.Commit()
+	return nil
+}
+
+// ── Void functions: diagnostic must point at Begin, not implicit return ──
+
+// badVoidWorker: no return value, tx never closed.
+func badVoidWorker(db *gorm.DB) {
+	tx := db.Begin() // want "transaction started here is not guaranteed"
+	_ = tx
+}
+
+// badVoidHandler: Begin succeeds but no close on the happy path.
+func badVoidHandler(db *gorm.DB) {
+	tx := db.Begin() // want "transaction started here is not guaranteed"
+	if tx.Error != nil {
+		return
+	}
+	doWork(tx)
+}
+
+// goodVoidWorker: tx closed unconditionally via defer — no diagnostic.
+func goodVoidWorker(db *gorm.DB) {
+	tx := db.Begin()
+	defer tx.Rollback()
+	doWork(tx)
+}
+
+func doWork(_ *gorm.DB) {}
+
+// ── Fixed false positives ──
+
+// goodMethodValueClose closes tx via a bound method value.
+func goodMethodValueClose(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	commit := tx.Commit
+	return commit().Error
+}
+
+// goodMethodValueDefer closes tx via a deferred bound method value.
+func goodMethodValueDefer(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := tx.Rollback
+	defer rollback()
+	return doSomething()
+}
+
+// goodReturnDelegated wraps Begin and returns tx; closing is the caller's job.
+func goodReturnDelegated(db *gorm.DB) *gorm.DB {
+	return db.Begin()
+}
+
+func goodCallerOfDelegated(db *gorm.DB) error {
+	tx := goodReturnDelegated(db)
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer tx.Rollback()
+	return tx.Commit().Error
+}
+
+// goodDeferBeforeBegin: nil-guarded defer registered before Begin.
+func goodDeferBeforeBegin(db *gorm.DB, skip bool) error {
+	var tx *gorm.DB
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+	if skip {
+		return nil
+	}
+	tx = db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return tx.Commit().Error
+}
+
+// ── Interface dispatch ──
+
+type beginIface interface {
+	Begin() *gorm.DB
+}
+
+// badIfaceBegin: Begin via interface — leak not reported until interface dispatch fix.
+func badIfaceBegin(db beginIface) error {
+	tx := db.Begin()
+	_ = tx
+	return nil // want "transaction started here is not guaranteed"
+}
+
+func badIfaceBeginBranch(db beginIface, ok bool) error {
+	tx := db.Begin()
+	if ok {
+		return tx.Commit().Error
+	}
+	return nil // want "transaction started here is not guaranteed"
+}
+
+// badDeferClosureCondUnrelated: defer closes only when unrelated condition is true;
+// leaks when !a && !unrelated.
+func badDeferClosureCondUnrelated(db *gorm.DB, a bool, unrelated bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if unrelated {
+			tx.Rollback()
+		}
+	}()
+	if a {
+		return tx.Commit().Error
+	}
+	return nil // want "transaction started here is not guaranteed"
 }

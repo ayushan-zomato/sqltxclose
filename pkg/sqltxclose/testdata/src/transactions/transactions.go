@@ -239,19 +239,17 @@ func goodBooleanGuardCommit(db *sql.DB, condition bool) error {
 	return nil
 }
 
-// goodConditionalBeginWithParentTx: tx is only Begin'd when parentTx is nil.
-// The deferred closure only closes when parentTx was nil (i.e. we own the tx).
-// NOTE: For database/sql, the conditional-begin pattern with parentTx is tested
-// in jinzhutx since GORM's single-return Begin is easier for the analyzer to
-// detect. Here we test the simpler variant: always Begin, but defer guards
-// with a boolean that indicates ownership.
+// goodConditionalBeginWithParentTx: ownership tracked via a local bool that is
+// disarmed (set false) on the direct-commit path, so the defer unconditionally
+// covers all remaining paths.
 func goodConditionalBeginWithParentTx(db *sql.DB, isOwner bool) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
+	rollback := isOwner
 	defer func() {
-		if isOwner {
+		if rollback {
 			tx.Rollback()
 		}
 	}()
@@ -261,6 +259,7 @@ func goodConditionalBeginWithParentTx(db *sql.DB, isOwner bool) error {
 	}
 
 	tx.Commit()
+	rollback = false
 	return nil
 }
 
