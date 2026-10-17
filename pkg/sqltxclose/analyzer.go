@@ -59,6 +59,12 @@ func run(pass *analysis.Pass) (any, error) {
 				}
 			}
 
+			// If tx is returned from this function with no local close,
+			// closing is delegated to the caller — skip the diagnostic.
+			if txIsReturned(fn, tx) && !hasAnyLocalClose(fn, tx) {
+				continue
+			}
+
 			pos, closed := transactionClosedOnAllPaths(fn, tx)
 			if !closed {
 				pass.Reportf(
@@ -96,7 +102,7 @@ func hasAnyLocalClose(fn *ssa.Function, tx transaction) bool {
 				if isAnyCloseCall(&x.Call, tx) {
 					return true
 				}
-				if deferredClosureClosesTx(&x.Call, tx, false) {
+				if deferredClosureClosesTx(&x.Call, tx, false, fn) {
 					return true
 				}
 			}
@@ -216,4 +222,24 @@ func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []de
 			}
 		}
 	}
+}
+
+// txIsReturned reports whether the transaction value flows into any Return
+// instruction in fn. This detects the delegation pattern where a function
+// opens a tx and returns it to its caller (e.g. func begin() *gorm.DB { return db.Begin() }).
+func txIsReturned(fn *ssa.Function, tx transaction) bool {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
+			if !ok {
+				continue
+			}
+			for _, result := range ret.Results {
+				if isTxValue(result, tx) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
