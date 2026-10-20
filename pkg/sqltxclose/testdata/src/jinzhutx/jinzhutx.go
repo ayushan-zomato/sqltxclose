@@ -554,3 +554,74 @@ func badDeferClosureCondUnrelated(db *gorm.DB, a bool, unrelated bool) error {
 	}
 	return nil // want "transaction started here is not guaranteed"
 }
+
+// ── Tx reassignment ──
+
+// badTxReassign: first Begin is leaked when tx is reassigned.
+func badTxReassign(db *gorm.DB) error {
+	tx := db.Begin() // want "transaction started here is not guaranteed"
+	if tx.Error != nil {
+		return tx.Error
+	}
+	tx = db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer tx.Rollback()
+	return tx.Commit().Error
+}
+
+// badTxReassignLoop: only the last iteration's tx is closed by the defer.
+func badTxReassignLoop(db *gorm.DB, n int) error {
+	var tx *gorm.DB
+	for i := 0; i < n; i++ {
+		tx = db.Begin() // want "transaction started here is not guaranteed"
+		if tx.Error != nil {
+			return tx.Error
+		}
+	}
+	defer tx.Rollback()
+	return tx.Commit().Error
+}
+
+// ── Helper-commits (interprocedural) ──
+
+func commitViaHelper(tx *gorm.DB) error {
+	return tx.Commit().Error
+}
+
+func rollbackViaHelper(tx *gorm.DB) error {
+	return tx.Rollback().Error
+}
+
+// goodHelperCommits: tx passed to a helper that commits it.
+func goodHelperCommits(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return commitViaHelper(tx)
+}
+
+// goodHelperRollback: tx passed to a helper that rolls back.
+func goodHelperRollback(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return rollbackViaHelper(tx)
+}
+
+// badHelperNoClose: helper receives tx but never closes it.
+func helperNoClose(tx *gorm.DB) error {
+	_ = tx
+	return nil
+}
+
+func badHelperNoClose(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return helperNoClose(tx) // want "transaction started here is not guaranteed"
+}

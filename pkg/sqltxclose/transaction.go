@@ -4,6 +4,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -53,16 +54,30 @@ func findTransactions(fn *ssa.Function) []transaction {
 			case "database/sql":
 				tx := extractFromTuple(fn, call, 0)
 				if tx == nil {
+					// No Extract: tuple result fully discarded — unconditional leak.
+					// Use errVal=nil sentinel so run() can report immediately at tx.pos
+					// without running the BFS (which would report at the return site).
+					transactions = append(transactions, transaction{
+						value:    call,
+						discards: true,
+						pos:      call.Pos(),
+					})
 					continue
 				}
 				errVal := extractFromTuple(fn, call, 1)
 				txAlloc := findAllocFor(fn, tx)
 				guardAlloc := findBeginGuard(fn, call)
+				// If BOTH the tx and err Extracts have no referrers, both were assigned
+				// to _ (e.g. _, _ = db.Begin()). This is an unconditional leak.
+				discards := txAlloc == nil &&
+					(tx.Referrers() == nil || len(*tx.Referrers()) == 0) &&
+					(errVal == nil || errVal.Referrers() == nil || len(*errVal.Referrers()) == 0)
 				transactions = append(transactions, transaction{
 					value:      tx,
 					alloc:      txAlloc,
 					errVal:     errVal,
 					guardAlloc: guardAlloc,
+					discards:   discards,
 					pos:        call.Pos(),
 				})
 
@@ -425,7 +440,7 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClos
 	// We require: (a) closure condition is a local bool alloc (not a parameter),
 	// (b) every store of false to that alloc co-occurs with a direct close.
 	if closureClosesTxOnAnyPath(anonFn, txLoads) {
-		if boolAlloc := closureDisarmAlloc(closure, anonFn); boolAlloc != nil {
+		if boolAlloc := closureDisarmAlloc(closure, anonFn, fn); boolAlloc != nil {
 			if isTier2DisarmSound(fn, boolAlloc, tx) {
 				return true
 			}
@@ -438,7 +453,7 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClos
 // closureDisarmAlloc returns the bool alloc that the closure uses as a guard
 // condition (the "disarm" variable), or nil if no such alloc exists.
 // Only local allocs are accepted — bool parameters are not disarm variables.
-func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.Alloc {
+func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function, outerFn *ssa.Function) *ssa.Alloc {
 	for i, b := range closure.Bindings {
 		if i >= len(anonFn.FreeVars) {
 			break
@@ -447,7 +462,6 @@ func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.All
 		if !ok {
 			continue
 		}
-		// Must be a bool alloc (not *error, not *gorm.DB, etc.)
 		ptr, ok := alloc.Type().(*types.Pointer)
 		if !ok {
 			continue
@@ -456,13 +470,7 @@ func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.All
 		if !ok || basic.Kind() != types.Bool {
 			continue
 		}
-		// Must be a local alloc (heap-promoted local var), not a promoted parameter.
-		// SSA marks parameter allocs with a non-empty comment starting with the param name.
-		// Local vars initialised in the function body are written before the defer.
-		// We distinguish them by checking: does any block store false to this alloc?
-		// A bool parameter is stored at block 0 with the parameter value and never
-		// stored false by the function itself.
-		if hasFalseStore(anonFn.Parent(), alloc) {
+		if hasFalseStore(outerFn, alloc) {
 			return alloc
 		}
 	}
@@ -821,23 +829,23 @@ func beginMethodPackageFromReturnType(method *types.Func) string {
 	if !ok || sig.Results().Len() == 0 {
 		return ""
 	}
-
+	// Extract return type once — shared across all package checks.
+	result := sig.Results().At(0).Type()
+	if ptr, ok := result.(*types.Pointer); ok {
+		result = ptr.Elem()
+	}
+	named, ok := result.(*types.Named)
+	if !ok {
+		return ""
+	}
+	obj := named.Obj()
+	if obj.Pkg() == nil {
+		return ""
+	}
+	// Check name first, then match by return type package.
 	for pkgPath, info := range txPackages {
 		for _, m := range info.beginMethods {
-			if method.Name() != m {
-				continue
-			}
-			// Check that the first result type is *pkgPath.closeType.
-			result := sig.Results().At(0).Type()
-			if ptr, ok := result.(*types.Pointer); ok {
-				result = ptr.Elem()
-			}
-			named, ok := result.(*types.Named)
-			if !ok {
-				continue
-			}
-			obj := named.Obj()
-			if obj.Pkg() != nil && obj.Pkg().Path() == pkgPath && obj.Name() == info.closeType {
+			if method.Name() == m && obj.Pkg().Path() == pkgPath && obj.Name() == info.closeType {
 				return pkgPath
 			}
 		}
@@ -926,13 +934,10 @@ func isBoundCloseThunk(closure *ssa.MakeClosure, tx transaction) bool {
 	if !ok || len(closure.Bindings) == 0 {
 		return false
 	}
-	name := boundFn.Name()
-	// Thunk name pattern: "<MethodName>$bound"
-	const suffix = "$bound"
-	if len(name) <= len(suffix) || name[len(name)-len(suffix):] != suffix {
+	methodName, ok := strings.CutSuffix(boundFn.Name(), "$bound")
+	if !ok {
 		return false
 	}
-	methodName := name[:len(name)-len(suffix)]
 	for _, info := range txPackages {
 		for _, m := range info.closeMethods {
 			if methodName == m && isTxValue(closure.Bindings[0], tx) {
@@ -941,4 +946,72 @@ func isBoundCloseThunk(closure *ssa.MakeClosure, tx transaction) bool {
 		}
 	}
 	return false
+}
+
+// txValueFlowsIntoPhi reports whether the transaction value is an edge in a
+// Phi node — which means the Begin call is inside a loop and its value is
+// accumulated across iterations. In that case, all iterations except the last
+// leak their transaction.
+func txValueFlowsIntoPhi(tx transaction) bool {
+	if tx.value == nil {
+		return false
+	}
+	refs := tx.value.Referrers()
+	if refs == nil {
+		return false
+	}
+	for _, ref := range *refs {
+		if _, ok := ref.(*ssa.Phi); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// calleeClosesTxParam reports whether the callee of call closes the tx that was
+// passed as one of its arguments. This handles the helper-commit pattern:
+//
+//	func helper(tx *gorm.DB) error { return tx.Commit().Error }
+//	func f(db *gorm.DB) error { tx := db.Begin(); return helper(tx) }
+//
+// We do one level of interprocedural analysis: find the parameter index of tx
+// in the call args, then check if the callee closes that parameter on all paths.
+func calleeClosesTxParam(common *ssa.CallCommon, tx transaction) bool {
+	if common == nil {
+		return false
+	}
+	callee := common.StaticCallee()
+	if callee == nil || callee.Blocks == nil {
+		return false
+	}
+
+	// Find which argument position tx occupies.
+	paramIdx := -1
+	for i, arg := range common.Args {
+		if isTxValue(arg, tx) {
+			paramIdx = i
+			break
+		}
+	}
+	if paramIdx < 0 || paramIdx >= len(callee.Params) {
+		return false
+	}
+
+	// Build a synthetic transaction for the callee's parameter.
+	param := callee.Params[paramIdx]
+	paramAlloc := findAllocFor(callee, param)
+	synTx := transaction{
+		value: param,
+		alloc: paramAlloc,
+		pos:   common.Pos(),
+	}
+
+	// The callee must actually close the parameter — not just trivially not open it.
+	if !hasAnyLocalClose(callee, synTx, true) {
+		return false
+	}
+
+	// Check if the callee closes this parameter on all paths.
+	_, closed := transactionClosedOnAllPaths(callee, synTx)
+	return closed
 }

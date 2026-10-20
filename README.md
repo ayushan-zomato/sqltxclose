@@ -7,7 +7,7 @@
 1. clone the `repo` and cd inside the repo root
 2. execute the following commands
 ```sh
-go build -o sqltxclose ./cmd/sqltxclose
+go build -o .sqltxclose ./cmd/sqltxclose
 ./sqltxclose ./pkg/sqltxclose/testdata/src/transactions/ # or any package you want to run static checks on
 ```
 
@@ -17,3 +17,6 @@ go build -o sqltxclose ./cmd/sqltxclose
 
 0.08s user 0.16s system 87% cpu 0.280 total
 ```
+
+## limitations
+1. Note: only SrcFuncs in the current package are scanned. Callers in other packages that call a delegated-tx method are not checked (cross-package multi-package analysis is out of scope).
