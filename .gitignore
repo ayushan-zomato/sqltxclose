@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+/sqltxclose
 
 # Test binary, built with `go test -c`
 *.test
@@ -33,3 +34,4 @@ go.work.sum
 
 **/mod/cache/*
 *.mod
+.sqltxclose

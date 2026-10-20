@@ -294,3 +294,15 @@ func goodLoopBooleanGuard(db *sql.DB, items []int) error {
 	}
 	return nil
 }
+
+// badDiscardBegin: result of Begin is completely discarded — no assignment at all.
+func badDiscardBegin(db *sql.DB) error {
+	db.Begin() // want "transaction started here is not guaranteed"
+	return nil
+}
+
+// badBlankBegin: tx assigned to blank identifiers — never closed.
+func badBlankBegin(db *sql.DB) error {
+	_, _ = db.Begin() // want "transaction started here is not guaranteed"
+	return nil
+}

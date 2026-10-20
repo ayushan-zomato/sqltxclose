@@ -14,6 +14,7 @@ const (
 	txNotStarted txState = iota
 	txOpen
 	txClosed
+	txLeakedByReassign // tx was open when a new Begin overwrote the variable
 )
 
 type analysisState struct {
@@ -26,24 +27,6 @@ type stateKey struct {
 	state txState
 }
 
-// hasDirectCloseCall returns true when the function contains a non-deferred
-// Commit or Rollback call on tx. Used to allow the "boolean guard" pattern
-// where the defer conditionally closes and a direct close covers the other path.
-func hasDirectCloseCall(fn *ssa.Function, tx transaction) bool {
-	for _, block := range fn.Blocks {
-		for _, instr := range block.Instrs {
-			call, ok := instr.(*ssa.Call)
-			if !ok {
-				continue
-			}
-			if isAnyCloseCall(call.Common(), tx) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func transactionClosedOnAllPaths(
 	fn *ssa.Function,
 	tx transaction,
@@ -52,7 +35,7 @@ func transactionClosedOnAllPaths(
 		return token.NoPos, true
 	}
 
-	directClose := hasDirectCloseCall(fn, tx)
+	directClose := hasAnyLocalClose(fn, tx, false)
 
 	queue := []analysisState{{block: fn.Blocks[0], state: txNotStarted}}
 	visited := make(map[stateKey]struct{})
@@ -72,6 +55,12 @@ func transactionClosedOnAllPaths(
 
 		for _, instr := range current.block.Instrs {
 			state = transfer(instr, tx, state, directClose, fn)
+
+			// Reassignment detected: tx was open when a new Begin overwrote it.
+			// Report at the original Begin position, not the reassignment site.
+			if state == txLeakedByReassign {
+				return tx.pos, false
+			}
 
 			if ret, ok := instr.(*ssa.Return); ok {
 				handledReturn = true
@@ -139,12 +128,26 @@ func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClo
 		if isAnyCloseCall(x.Common(), tx) {
 			return txClosed
 		}
+		// tx passed to a helper that closes it.
+		if calleeClosesTxParam(x.Common(), tx) {
+			return txClosed
+		}
 	case *ssa.Defer:
 		if isAnyCloseCall(&x.Call, tx) {
 			return txClosed
 		}
 		if deferredClosureClosesTx(&x.Call, tx, hasDirectClose, fn) {
 			return txClosed
+		}
+	}
+
+	// When the tx is open and we encounter a new Begin call (not this tx's own
+	// Begin), the variable is being reassigned — the current tx leaks here.
+	if state == txOpen {
+		if call, ok := instr.(*ssa.Call); ok {
+			if beginCallPackage(call) != "" && !sameValue(call, tx.value) {
+				return txLeakedByReassign
+			}
 		}
 	}
 
