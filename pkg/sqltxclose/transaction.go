@@ -1103,13 +1103,22 @@ func txValueFlowsIntoPhi(tx transaction) bool {
 	return false
 }
 
-func calleeClosesTxParam(common *ssa.CallCommon, tx transaction) bool {
+func calleeClosesTxParam(common *ssa.CallCommon, tx transaction, visitedFuncs map[*ssa.Function]struct{}) bool {
 	if common == nil {
 		return false
 	}
 	callee := common.StaticCallee()
 	if callee == nil || callee.Blocks == nil {
 		return false
+	}
+
+	// Prevent infinite recursion for recursive callees (e.g. retry(tx, n-1)).
+	// If we've already entered this function in the current interprocedural
+	// chain, conservatively assume it does not close the transaction.
+	if visitedFuncs != nil {
+		if _, seen := visitedFuncs[callee]; seen {
+			return false
+		}
 	}
 
 	paramIdx := -1
@@ -1135,6 +1144,6 @@ func calleeClosesTxParam(common *ssa.CallCommon, tx transaction) bool {
 		return false
 	}
 
-	_, closed := transactionClosedOnAllPaths(callee, synTx)
+	_, closed := transactionClosedOnAllPaths(callee, synTx, txOpen, visitedFuncs)
 	return closed
 }

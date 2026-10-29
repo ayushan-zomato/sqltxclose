@@ -1,6 +1,11 @@
 package transactions
 
-import "database/sql"
+import (
+	"database/sql"
+	"log"
+	"os"
+	"testing"
+)
 
 func goodCommit(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -305,4 +310,139 @@ func badDiscardBegin(db *sql.DB) error {
 func badBlankBegin(db *sql.DB) error {
 	_, _ = db.Begin() // want "transaction started here is not guaranteed"
 	return nil
+}
+
+// --- Recursive helper regression tests (must not cause stack overflow) ---
+
+// badRecursiveHelperPartialClose: recursive helper that commits tx in the base
+// case but delegates to itself on the error path. The recursive call cannot be
+// statically proven to close, so the analyzer conservatively reports it.
+// Critically, this must NOT stack-overflow — it must terminate and report.
+func badRecursiveHelperPartialClose(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	return retryCommit(tx, 3) // want "transaction started here is not guaranteed"
+}
+
+func retryCommit(tx *sql.Tx, n int) error {
+	if n == 0 {
+		return tx.Commit()
+	}
+	if err := doSomething(); err != nil {
+		return retryCommit(tx, n-1)
+	}
+	return tx.Commit()
+}
+
+// badRecursiveHelperNeverCloses: recursive helper that never closes the tx.
+// Should still report a diagnostic (not stack-overflow).
+func badRecursiveHelperNeverCloses(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	return recurseForever(tx, 3) // want "transaction started here is not guaranteed"
+}
+
+func recurseForever(tx *sql.Tx, n int) error {
+	if n == 0 {
+		return nil
+	}
+	return recurseForever(tx, n-1)
+}
+
+// --- Return-delegation tests (tx returned = closing delegated to caller) ---
+
+// goodReturnTx: tx is returned on every path — caller is responsible for closing.
+func goodReturnTx(db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// goodReturnTxWithWork: tx is returned after some setup work;
+// caller is responsible for closing. No diagnostic expected.
+func goodReturnTxWithWork(db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if err := doSomething(); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
+// goodCallerClosesReturnedTx: caller of a Begin-wrapper closes the tx.
+// The linter should not flag either function.
+func goodCallerClosesReturnedTx(db *sql.DB) error {
+	tx, err := goodReturnTxWithWork(db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	return tx.Commit()
+}
+
+// badReturnTxPartial: tx is returned on one path but leaked on the early-exit path.
+func badReturnTxPartial(db *sql.DB, early bool) (*sql.Tx, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if early {
+		return nil, nil // want "transaction started here is not guaranteed"
+	}
+	return tx, nil
+}
+
+// --- Terminator function tests (t.Fatal, os.Exit, log.Fatal) ---
+
+// goodFatalAfterBeginError: t.Fatal on Begin error — no leak.
+func goodFatalAfterBeginError(t *testing.T, db *sql.DB) {
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	tx.Commit()
+}
+
+// goodFatalOnlyClose: t.Fatal is the only "close" — process terminates,
+// DB server rolls back. No diagnostic expected.
+func goodFatalOnlyClose(t *testing.T, db *sql.DB) {
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := doSomething(); err != nil {
+		t.Fatalf("operation failed: %v", err)
+	}
+	_ = tx
+	t.Fatal("always fatal")
+}
+
+// goodOsExit: os.Exit terminates the process — no leak.
+func goodOsExit(db *sql.DB) {
+	tx, err := db.Begin()
+	if err != nil {
+		os.Exit(1)
+	}
+	_ = tx
+	os.Exit(0)
+}
+
+// goodLogFatal: log.Fatal terminates the process — no leak.
+func goodLogFatal(db *sql.DB) {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	_ = tx
+	log.Fatal("done")
 }

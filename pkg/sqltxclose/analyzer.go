@@ -67,12 +67,6 @@ func run(pass *analysis.Pass) (any, error) {
 				continue
 			}
 
-			// If tx is returned from this function with no local close,
-			// closing is delegated to the caller — skip the diagnostic.
-			if txIsReturned(fn, tx) && !hasAnyLocalClose(fn, tx, true) {
-				continue
-			}
-
 			// If tx flows into a Phi node, it is opened inside a loop.
 			// All iterations except the last leak their transaction.
 			if txValueFlowsIntoPhi(tx) {
@@ -81,7 +75,7 @@ func run(pass *analysis.Pass) (any, error) {
 				continue
 			}
 
-			pos, closed := transactionClosedOnAllPaths(fn, tx)
+			pos, closed := transactionClosedOnAllPaths(fn, tx, txNotStarted, nil)
 			if !closed {
 				pass.Reportf(
 					pos,
@@ -233,7 +227,7 @@ func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []de
 				// handled by the field-load open semantics: the tx is only
 				// considered open when b.tx is first accessed.
 
-				pos, closed := transactionClosedOnAllPaths(fn, synTx)
+				pos, closed := transactionClosedOnAllPaths(fn, synTx, txNotStarted, nil)
 				if !closed {
 					pass.Reportf(
 						pos,
@@ -246,20 +240,3 @@ func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []de
 	}
 }
 
-// txIsReturned reports whether the transaction value is returned from fn,
-// indicating the caller is responsible for closing it.
-func txIsReturned(_ *ssa.Function, tx transaction) bool {
-	if tx.value == nil {
-		return false
-	}
-	refs := tx.value.Referrers()
-	if refs == nil {
-		return false
-	}
-	for _, ref := range *refs {
-		if _, ok := ref.(*ssa.Return); ok {
-			return true
-		}
-	}
-	return false
-}

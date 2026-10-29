@@ -626,6 +626,23 @@ func badHelperNoClose(db *gorm.DB) error {
 	return helperNoClose(tx) // want "transaction started here is not guaranteed"
 }
 
+// badHelperPartialClose: helper closes tx only on one branch — the other
+// path returns without closing. Caller must get a diagnostic.
+func helperPartialClose(tx *gorm.DB, ok bool) error {
+	if ok {
+		return tx.Commit().Error
+	}
+	return nil
+}
+
+func badHelperPartialClose(db *gorm.DB, ok bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return helperPartialClose(tx, ok) // want "transaction started here is not guaranteed"
+}
+
 // goodDeferRollbackDirectCommit: defer rolls back on error; direct Commit on success path.
 // The else branch does unrelated work (e.g. fire a goroutine) — no close there.
 func goodDeferRollbackDirectCommit(db *gorm.DB) (err error) {
