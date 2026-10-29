@@ -23,6 +23,7 @@ type transaction struct {
 	guardAlloc ssa.Value  // Non-nil when Begin is conditional (e.g., if parentTx == nil { tx = db.Begin() })
 	fieldBase  ssa.Value  // Non-nil when tx is stored to a struct field: the Alloc of the struct pointer
 	fieldIndex int        // Field index within the struct (valid when fieldBase != nil)
+	discards   bool       // True when the Begin result is fully discarded (no Extract) — unconditional leak
 	pos        token.Pos
 }
 
@@ -52,20 +53,29 @@ func run(pass *analysis.Pass) (any, error) {
 		for _, tx := range txs {
 			// If tx is stored to a struct field and not closed locally,
 			// record it as delegated — the caller is responsible.
-			if tx.fieldBase != nil && !hasAnyLocalClose(fn, tx) {
+			if tx.fieldBase != nil && !hasAnyLocalClose(fn, tx, true) {
 				if dt, ok := makeDelegatedTx(fn, tx); ok {
 					delegated = append(delegated, dt)
 					continue
 				}
 			}
 
-			// If tx is returned from this function with no local close,
-			// closing is delegated to the caller — skip the diagnostic.
-			if txIsReturned(fn, tx) && !hasAnyLocalClose(fn, tx) {
+			// Unconditional leak: Begin result was fully discarded (no Extract).
+			if tx.discards {
+				pass.Reportf(tx.pos,
+					"transaction started here is not guaranteed to be committed or rolled back")
 				continue
 			}
 
-			pos, closed := transactionClosedOnAllPaths(fn, tx)
+			// If tx flows into a Phi node, it is opened inside a loop.
+			// All iterations except the last leak their transaction.
+			if txValueFlowsIntoPhi(tx) {
+				pass.Reportf(tx.pos,
+					"transaction started here is not guaranteed to be committed or rolled back")
+				continue
+			}
+
+			pos, closed := transactionClosedOnAllPaths(fn, tx, txNotStarted, nil)
 			if !closed {
 				pass.Reportf(
 					pos,
@@ -88,9 +98,9 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// hasAnyLocalClose returns true if fn contains any close call (direct or deferred)
-// on the given transaction.
-func hasAnyLocalClose(fn *ssa.Function, tx transaction) bool {
+// hasAnyLocalClose returns true if fn contains a close call on tx.
+// When withDefers is true, deferred calls and closure defers are also checked.
+func hasAnyLocalClose(fn *ssa.Function, tx transaction, withDefers bool) bool {
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			switch x := instr.(type) {
@@ -99,6 +109,9 @@ func hasAnyLocalClose(fn *ssa.Function, tx transaction) bool {
 					return true
 				}
 			case *ssa.Defer:
+				if !withDefers {
+					continue
+				}
 				if isAnyCloseCall(&x.Call, tx) {
 					return true
 				}
@@ -170,6 +183,9 @@ func txCloseInfo(tx transaction) (string, string) {
 
 // checkDelegatedCallers scans fn for calls to delegated-tx methods and verifies
 // that the struct field is properly closed after the call.
+// Note: only SrcFuncs in the current package are scanned. Callers in other
+// packages that call a delegated-tx method are not checked (cross-package
+// multi-package analysis is out of scope).
 func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []delegatedTx) {
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
@@ -211,7 +227,7 @@ func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []de
 				// handled by the field-load open semantics: the tx is only
 				// considered open when b.tx is first accessed.
 
-				pos, closed := transactionClosedOnAllPaths(fn, synTx)
+				pos, closed := transactionClosedOnAllPaths(fn, synTx, txNotStarted, nil)
 				if !closed {
 					pass.Reportf(
 						pos,
@@ -224,22 +240,3 @@ func checkDelegatedCallers(pass *analysis.Pass, fn *ssa.Function, delegated []de
 	}
 }
 
-// txIsReturned reports whether the transaction value flows into any Return
-// instruction in fn. This detects the delegation pattern where a function
-// opens a tx and returns it to its caller (e.g. func begin() *gorm.DB { return db.Begin() }).
-func txIsReturned(fn *ssa.Function, tx transaction) bool {
-	for _, block := range fn.Blocks {
-		for _, instr := range block.Instrs {
-			ret, ok := instr.(*ssa.Return)
-			if !ok {
-				continue
-			}
-			for _, result := range ret.Results {
-				if isTxValue(result, tx) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}

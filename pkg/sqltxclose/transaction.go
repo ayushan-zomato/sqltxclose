@@ -4,6 +4,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -23,7 +24,7 @@ var txPackages = map[string]struct {
 	"gorm.io/gorm": {
 		beginMethods: []string{"Begin"},
 		beginType:    "DB",
-		closeMethods: []string{"Commit", "Rollback"},
+		closeMethods: []string{"Commit", "Rollback"}, // RollbackUnlessCommitted is jinzhu-only
 		closeType:    "DB",
 	},
 	"github.com/jinzhu/gorm": {
@@ -53,16 +54,30 @@ func findTransactions(fn *ssa.Function) []transaction {
 			case "database/sql":
 				tx := extractFromTuple(fn, call, 0)
 				if tx == nil {
+					// No Extract: tuple result fully discarded — unconditional leak.
+					// Use errVal=nil sentinel so run() can report immediately at tx.pos
+					// without running the BFS (which would report at the return site).
+					transactions = append(transactions, transaction{
+						value:    call,
+						discards: true,
+						pos:      call.Pos(),
+					})
 					continue
 				}
 				errVal := extractFromTuple(fn, call, 1)
 				txAlloc := findAllocFor(fn, tx)
 				guardAlloc := findBeginGuard(fn, call)
+				// If BOTH the tx and err Extracts have no referrers, both were assigned
+				// to _ (e.g. _, _ = db.Begin()). This is an unconditional leak.
+				discards := txAlloc == nil &&
+					(tx.Referrers() == nil || len(*tx.Referrers()) == 0) &&
+					(errVal == nil || errVal.Referrers() == nil || len(*errVal.Referrers()) == 0)
 				transactions = append(transactions, transaction{
 					value:      tx,
 					alloc:      txAlloc,
 					errVal:     errVal,
 					guardAlloc: guardAlloc,
+					discards:   discards,
 					pos:        call.Pos(),
 				})
 
@@ -373,16 +388,10 @@ func sameFieldBase(v, base ssa.Value) bool {
 }
 
 // deferredClosureClosesTx returns true when a deferred closure is guaranteed to
-// close the transaction. It uses a two-tier check:
-//  1. If the closure closes tx on ALL paths (accounting for nil/guard branches), accept.
-//  2. If the closure closes on ANY path AND the outer function also has a direct
-//     (non-deferred) close, accept — the conditional close in the defer is paired
-//     with the direct close (e.g. boolean guard pattern).
-//
-// Note: tier-2 is intentionally permissive — it accepts some patterns that are
-// technically unsound (e.g. when the closure condition and the direct-close
-// condition are not complementary). Fixing this properly requires path-correlation
-// analysis across the outer function and the closure. See TODOS.md #2.
+// close the transaction. Two-tier check:
+//  1. Closure closes tx on ALL paths (nil/guard branches excused).
+//  2. Closure conditionally closes via a rollback-guard bool, AND a direct close
+//     exists in the outer function (boolean guard / commit-then-disarm pattern).
 func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClose bool, fn *ssa.Function) bool {
 	if call == nil {
 		return false
@@ -418,27 +427,89 @@ func deferredClosureClosesTx(call *ssa.CallCommon, tx transaction, hasDirectClos
 		return true
 	}
 
-	// Tier 2: "disarm" pattern — closure conditionally closes via a bool alloc
-	// that is set to false on every direct-close block in the outer function.
-	// e.g.: rollback := true; defer func(){ if rollback { tx.Rollback() } }()
-	//       tx.Commit(); rollback = false  ← disarms the defer on success path
-	// We require: (a) closure condition is a local bool alloc (not a parameter),
-	// (b) every store of false to that alloc co-occurs with a direct close.
+	// Tier 2a: rollback-guard bool pattern.
 	if closureClosesTxOnAnyPath(anonFn, txLoads) {
-		if boolAlloc := closureDisarmAlloc(closure, anonFn); boolAlloc != nil {
-			if isTier2DisarmSound(fn, boolAlloc, tx) {
+		boolAlloc, disarmVal := closureDisarmAlloc(closure, anonFn, fn)
+		if boolAlloc != nil {
+			if isTier2DisarmSound(fn, boolAlloc, disarmVal, tx) {
 				return true
 			}
+		}
+		if isArmedBeforeDeferSound(call, closure, anonFn, fn, tx) {
+			return true
+		}
+		// Tier 2b: named-return-error pattern.
+		if hasDirectClose && closureConditionsOnNamedReturnError(closure, anonFn) {
+			return true
 		}
 	}
 
 	return false
 }
 
-// closureDisarmAlloc returns the bool alloc that the closure uses as a guard
-// condition (the "disarm" variable), or nil if no such alloc exists.
-// Only local allocs are accepted — bool parameters are not disarm variables.
-func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.Alloc {
+// isArmedBeforeDeferSound accepts `rollback := false; ...; rollback = true;
+// defer func() { if rollback { tx.Rollback() } }()` when every later disarm
+// store is paired with a close of tx.
+func isArmedBeforeDeferSound(deferCall *ssa.CallCommon, closure *ssa.MakeClosure, anonFn, fn *ssa.Function, tx transaction) bool {
+	for _, block := range fn.Blocks {
+		for i, instr := range block.Instrs {
+			if d, ok := instr.(*ssa.Defer); !ok || &d.Call != deferCall {
+				continue
+			}
+			for j := i - 1; j >= 0; j-- {
+				store, ok := block.Instrs[j].(*ssa.Store)
+				if !ok || !isBoolBinding(store.Addr, closure, anonFn) {
+					continue
+				}
+				c, ok := store.Val.(*ssa.Const)
+				if !ok || c.Value == nil || c.Value.Kind() != constant.Bool {
+					continue
+				}
+				return disarmStoresClose(fn, store.Addr, !constant.BoolVal(c.Value), tx)
+			}
+		}
+	}
+	return false
+}
+
+func isBoolBinding(v ssa.Value, closure *ssa.MakeClosure, anonFn *ssa.Function) bool {
+	for i, b := range closure.Bindings {
+		if b == v && i < len(anonFn.FreeVars) {
+			basic, ok := v.Type().(*types.Pointer).Elem().(*types.Basic)
+			return ok && basic.Kind() == types.Bool
+		}
+	}
+	return false
+}
+
+// disarmStoresClose requires every store of disarm to addr, except the
+// initializer, to be paired with a close of tx.
+func disarmStoresClose(fn *ssa.Function, addr ssa.Value, disarm bool, tx transaction) bool {
+	for _, block := range fn.Blocks {
+		skipInit := block == addr.(*ssa.Alloc).Block()
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok || store.Addr != addr {
+				continue
+			}
+			if skipInit {
+				skipInit = false
+				continue
+			}
+			if c, ok := store.Val.(*ssa.Const); ok && c.Value != nil && c.Value.Kind() == constant.Bool &&
+				constant.BoolVal(c.Value) == disarm && !blockOrPredClosesTx(block, tx) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// closureDisarmAlloc finds the bool alloc used as a rollback guard in the closure
+// and returns (alloc, disarmValue) where disarmValue is the constant that disarms it.
+// Polarity is inferred from the initialization: `rollback := true` → disarm=false,
+// `committed := false` → disarm=true.
+func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function, outerFn *ssa.Function) (*ssa.Alloc, bool) {
 	for i, b := range closure.Bindings {
 		if i >= len(anonFn.FreeVars) {
 			break
@@ -456,17 +527,82 @@ func closureDisarmAlloc(closure *ssa.MakeClosure, anonFn *ssa.Function) *ssa.All
 		if !ok || basic.Kind() != types.Bool {
 			continue
 		}
-		// Must be a local alloc (heap-promoted local var), not a promoted parameter.
-		// SSA marks parameter allocs with a non-empty comment starting with the param name.
-		// Local vars initialised in the function body are written before the defer.
-		// We distinguish them by checking: does any block store false to this alloc?
-		// A bool parameter is stored at block 0 with the parameter value and never
-		// stored false by the function itself.
-		if hasFalseStore(anonFn.Parent(), alloc) {
-			return alloc
+		// Infer polarity from the initialization constant store (same block as Alloc).
+		// `rollback := true` → init=true → disarm=false.
+		// `committed := false` → init=false → disarm=true.
+		// For param-init (`rollback := isOwner`), fall back to checking explicit disarm stores.
+		if initVal, initOk := initConstBoolStore(outerFn, alloc); initOk {
+			return alloc, !initVal
+		}
+		// Param-initialized guard: look for an explicit false store (rollback=false disarm).
+		if hasFalseStore(outerFn, alloc) {
+			return alloc, false
 		}
 	}
-	return nil
+	return nil, false
+}
+
+// closureConditionsOnNamedReturnError reports whether the closure captures a
+// named-return *error free variable and conditions a close call on it.
+func closureConditionsOnNamedReturnError(closure *ssa.MakeClosure, anonFn *ssa.Function) bool {
+	for i, b := range closure.Bindings {
+		if i >= len(anonFn.FreeVars) {
+			break
+		}
+		ptr, ok := anonFn.FreeVars[i].Type().(*types.Pointer)
+		if !ok {
+			continue
+		}
+		if types.Identical(ptr.Elem(), types.Universe.Lookup("error").Type()) {
+			if _, isAlloc := b.(*ssa.Alloc); isAlloc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// initConstBoolStore returns the first boolean constant stored to alloc in fn
+// (the initialization value, e.g. `rollback := true` or `committed := false`).
+func initConstBoolStore(fn *ssa.Function, alloc *ssa.Alloc) (val bool, ok bool) {
+	// The init store immediately follows the Alloc instruction in the same block.
+	for _, block := range fn.Blocks {
+		allocFound := false
+		for _, instr := range block.Instrs {
+			if instr == alloc {
+				allocFound = true
+				continue
+			}
+			if !allocFound {
+				continue
+			}
+			store, isStore := instr.(*ssa.Store)
+			if !isStore || store.Addr != alloc {
+				continue
+			}
+			c, isConst := store.Val.(*ssa.Const)
+			if !isConst || c.Value == nil || c.Value.Kind() != constant.Bool {
+				continue
+			}
+			return constant.BoolVal(c.Value), true
+		}
+	}
+	return false, false
+}
+
+func hasTrueConstStore(fn *ssa.Function, alloc *ssa.Alloc) bool {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.Store)
+			if !ok || store.Addr != alloc {
+				continue
+			}
+			if isConstTrue(store.Val) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasFalseStore reports whether fn contains any store of false to alloc.
@@ -489,10 +625,9 @@ func hasFalseStore(fn *ssa.Function, alloc *ssa.Alloc) bool {
 	return false
 }
 
-// isTier2DisarmSound verifies that every store of false to boolAlloc in the
-// outer function co-occurs with a direct close of tx in the same block.
-// This ensures the "disarm" stores are always paired with a close.
-func isTier2DisarmSound(fn *ssa.Function, boolAlloc *ssa.Alloc, tx transaction) bool {
+// isTier2DisarmSound verifies that every disarm store to boolAlloc co-occurs with
+// a close of tx (same block or straight-line predecessor).
+func isTier2DisarmSound(fn *ssa.Function, boolAlloc *ssa.Alloc, disarmValue bool, tx transaction) bool {
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			store, ok := instr.(*ssa.Store)
@@ -503,11 +638,13 @@ func isTier2DisarmSound(fn *ssa.Function, boolAlloc *ssa.Alloc, tx transaction) 
 			if !ok {
 				continue
 			}
-			if c.Value == nil || c.Value.Kind() != constant.Bool || constant.BoolVal(c.Value) {
+			if c.Value == nil || c.Value.Kind() != constant.Bool {
 				continue
 			}
-			// Found a "disarm" (false store). The same block must close the tx.
-			if !blockClosesTx(block, tx) {
+			if constant.BoolVal(c.Value) != disarmValue {
+				continue
+			}
+			if !blockOrPredClosesTx(block, tx) {
 				return false
 			}
 		}
@@ -781,7 +918,6 @@ func isTxCloseCallOnLoads(common *ssa.CallCommon, txLoads map[ssa.Value]struct{}
 	return false
 }
 
-
 // beginCallPackage returns the package path if the call is a Begin/BeginTx on a recognised type.
 // Handles both static calls (StaticCallee != nil) and interface dispatch (IsInvoke).
 func beginCallPackage(call *ssa.Call) string {
@@ -821,23 +957,21 @@ func beginMethodPackageFromReturnType(method *types.Func) string {
 	if !ok || sig.Results().Len() == 0 {
 		return ""
 	}
-
+	result := sig.Results().At(0).Type()
+	if ptr, ok := result.(*types.Pointer); ok {
+		result = ptr.Elem()
+	}
+	named, ok := result.(*types.Named)
+	if !ok {
+		return ""
+	}
+	obj := named.Obj()
+	if obj.Pkg() == nil {
+		return ""
+	}
 	for pkgPath, info := range txPackages {
 		for _, m := range info.beginMethods {
-			if method.Name() != m {
-				continue
-			}
-			// Check that the first result type is *pkgPath.closeType.
-			result := sig.Results().At(0).Type()
-			if ptr, ok := result.(*types.Pointer); ok {
-				result = ptr.Elem()
-			}
-			named, ok := result.(*types.Named)
-			if !ok {
-				continue
-			}
-			obj := named.Obj()
-			if obj.Pkg() != nil && obj.Pkg().Path() == pkgPath && obj.Name() == info.closeType {
+			if method.Name() == m && obj.Pkg().Path() == pkgPath && obj.Name() == info.closeType {
 				return pkgPath
 			}
 		}
@@ -926,13 +1060,10 @@ func isBoundCloseThunk(closure *ssa.MakeClosure, tx transaction) bool {
 	if !ok || len(closure.Bindings) == 0 {
 		return false
 	}
-	name := boundFn.Name()
-	// Thunk name pattern: "<MethodName>$bound"
-	const suffix = "$bound"
-	if len(name) <= len(suffix) || name[len(name)-len(suffix):] != suffix {
+	methodName, ok := strings.CutSuffix(boundFn.Name(), "$bound")
+	if !ok {
 		return false
 	}
-	methodName := name[:len(name)-len(suffix)]
 	for _, info := range txPackages {
 		for _, m := range info.closeMethods {
 			if methodName == m && isTxValue(closure.Bindings[0], tx) {
@@ -941,4 +1072,78 @@ func isBoundCloseThunk(closure *ssa.MakeClosure, tx transaction) bool {
 		}
 	}
 	return false
+}
+
+// txValueFlowsIntoPhi reports whether the transaction value flows into a loop Phi
+// — a Phi node where one of the predecessors is a back-edge (loop iteration).
+// A conditional-merge Phi (if-else) is NOT a loop and should not be flagged.
+// We detect loop Phis by checking if any predecessor of the Phi's block has a
+// higher index than the Phi's block itself (back-edge heuristic in SSA).
+func txValueFlowsIntoPhi(tx transaction) bool {
+	if tx.value == nil {
+		return false
+	}
+	refs := tx.value.Referrers()
+	if refs == nil {
+		return false
+	}
+	for _, ref := range *refs {
+		phi, ok := ref.(*ssa.Phi)
+		if !ok {
+			continue
+		}
+		// Check if this Phi is a loop Phi: any predecessor has index >= phi's block.
+		phiBlock := phi.Block()
+		for _, pred := range phiBlock.Preds {
+			if pred.Index >= phiBlock.Index {
+				return true // back-edge → loop Phi
+			}
+		}
+	}
+	return false
+}
+
+func calleeClosesTxParam(common *ssa.CallCommon, tx transaction, visitedFuncs map[*ssa.Function]struct{}) bool {
+	if common == nil {
+		return false
+	}
+	callee := common.StaticCallee()
+	if callee == nil || callee.Blocks == nil {
+		return false
+	}
+
+	// Prevent infinite recursion for recursive callees (e.g. retry(tx, n-1)).
+	// If we've already entered this function in the current interprocedural
+	// chain, conservatively assume it does not close the transaction.
+	if visitedFuncs != nil {
+		if _, seen := visitedFuncs[callee]; seen {
+			return false
+		}
+	}
+
+	paramIdx := -1
+	for i, arg := range common.Args {
+		if isTxValue(arg, tx) {
+			paramIdx = i
+			break
+		}
+	}
+	if paramIdx < 0 || paramIdx >= len(callee.Params) {
+		return false
+	}
+
+	param := callee.Params[paramIdx]
+	paramAlloc := findAllocFor(callee, param)
+	synTx := transaction{
+		value: param,
+		alloc: paramAlloc,
+		pos:   common.Pos(),
+	}
+
+	if !hasAnyLocalClose(callee, synTx, true) {
+		return false
+	}
+
+	_, closed := transactionClosedOnAllPaths(callee, synTx, txOpen, visitedFuncs)
+	return closed
 }

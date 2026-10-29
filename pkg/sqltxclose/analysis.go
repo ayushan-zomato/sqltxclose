@@ -14,6 +14,7 @@ const (
 	txNotStarted txState = iota
 	txOpen
 	txClosed
+	txLeakedByReassign // tx was open when a new Begin overwrote the variable
 )
 
 type analysisState struct {
@@ -26,35 +27,24 @@ type stateKey struct {
 	state txState
 }
 
-// hasDirectCloseCall returns true when the function contains a non-deferred
-// Commit or Rollback call on tx. Used to allow the "boolean guard" pattern
-// where the defer conditionally closes and a direct close covers the other path.
-func hasDirectCloseCall(fn *ssa.Function, tx transaction) bool {
-	for _, block := range fn.Blocks {
-		for _, instr := range block.Instrs {
-			call, ok := instr.(*ssa.Call)
-			if !ok {
-				continue
-			}
-			if isAnyCloseCall(call.Common(), tx) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func transactionClosedOnAllPaths(
 	fn *ssa.Function,
 	tx transaction,
+	initialState txState,
+	visitedFuncs map[*ssa.Function]struct{},
 ) (token.Pos, bool) {
 	if len(fn.Blocks) == 0 {
 		return token.NoPos, true
 	}
 
-	directClose := hasDirectCloseCall(fn, tx)
+	if visitedFuncs == nil {
+		visitedFuncs = make(map[*ssa.Function]struct{})
+	}
+	visitedFuncs[fn] = struct{}{}
 
-	queue := []analysisState{{block: fn.Blocks[0], state: txNotStarted}}
+	directClose := hasAnyLocalClose(fn, tx, false)
+
+	queue := []analysisState{{block: fn.Blocks[0], state: initialState}}
 	visited := make(map[stateKey]struct{})
 
 	for len(queue) > 0 {
@@ -71,7 +61,13 @@ func transactionClosedOnAllPaths(
 		handledReturn := false
 
 		for _, instr := range current.block.Instrs {
-			state = transfer(instr, tx, state, directClose, fn)
+			state = transfer(instr, tx, state, directClose, fn, visitedFuncs)
+
+			// Reassignment detected: tx was open when a new Begin overwrote it.
+			// Report at the original Begin position, not the reassignment site.
+			if state == txLeakedByReassign {
+				return tx.pos, false
+			}
 
 			if ret, ok := instr.(*ssa.Return); ok {
 				handledReturn = true
@@ -133,10 +129,19 @@ func transactionClosedOnAllPaths(
 	return token.NoPos, true
 }
 
-func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClose bool, fn *ssa.Function) txState {
+func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClose bool, fn *ssa.Function, visitedFuncs map[*ssa.Function]struct{}) txState {
 	switch x := instr.(type) {
 	case *ssa.Call:
 		if isAnyCloseCall(x.Common(), tx) {
+			return txClosed
+		}
+		// tx passed to a helper that closes it.
+		if calleeClosesTxParam(x.Common(), tx, visitedFuncs) {
+			return txClosed
+		}
+		// Terminator call (t.Fatal, os.Exit, log.Fatal, …) — the process is
+		// ending; the DB server will roll back any uncommitted transaction.
+		if isTerminatorCall(x.Common()) {
 			return txClosed
 		}
 	case *ssa.Defer:
@@ -145,6 +150,16 @@ func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClo
 		}
 		if deferredClosureClosesTx(&x.Call, tx, hasDirectClose, fn) {
 			return txClosed
+		}
+	}
+
+	// When the tx is open and we encounter a new Begin call (not this tx's own
+	// Begin), the variable is being reassigned — the current tx leaks here.
+	if state == txOpen {
+		if call, ok := instr.(*ssa.Call); ok {
+			if beginCallPackage(call) != "" && !sameValue(call, tx.value) {
+				return txLeakedByReassign
+			}
 		}
 	}
 
@@ -160,6 +175,18 @@ func transfer(instr ssa.Instruction, tx transaction, state txState, hasDirectClo
 		} else if tx.fieldBase != nil {
 			if v, ok := instr.(ssa.Value); ok && isFieldLoad(v, tx) {
 				return txOpen
+			}
+		}
+	}
+
+	// If tx is returned from this function, closing responsibility is
+	// delegated to the caller — treat this path as closed.
+	if state == txOpen {
+		if ret, ok := instr.(*ssa.Return); ok {
+			for _, v := range ret.Results {
+				if isTxValue(v, tx) {
+					return txClosed
+				}
 			}
 		}
 	}
@@ -432,5 +459,73 @@ func isErrValue(v, errVal ssa.Value, fn *ssa.Function) bool {
 		}
 	}
 
+	return false
+}
+
+// terminatorFuncs maps package path → set of function/method names that never
+// return normally. After such a call the process (or goroutine) terminates;
+// the DB server will roll back any uncommitted transaction on connection close.
+var terminatorFuncs = map[string]map[string]struct{}{
+	"testing": toSet("Fatal", "Fatalf", "FailNow"),
+	"os":      toSet("Exit"),
+	"log":     toSet("Fatal", "Fatalln", "Fatalf", "Panic", "Panicln", "Panicf"),
+	"runtime": toSet("Goexit"),
+}
+
+func toSet(names ...string) map[string]struct{} {
+	s := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		s[n] = struct{}{}
+	}
+	return s
+}
+
+// isTerminatorCall reports whether the call is to a function that never returns
+// normally (listed in terminatorFuncs).
+func isTerminatorCall(common *ssa.CallCommon) bool {
+	if common == nil {
+		return false
+	}
+
+	callee := common.StaticCallee()
+	if callee == nil {
+		if common.Method == nil {
+			return false
+		}
+		name := common.Method.Name()
+		recv := common.Method.Type().(*types.Signature).Recv()
+		if recv == nil {
+			return false
+		}
+		recvType := recv.Type()
+		if ptr, ok := recvType.(*types.Pointer); ok {
+			recvType = ptr.Elem()
+		}
+		named, ok := recvType.(*types.Named)
+		if !ok {
+			return false
+		}
+		pkg := named.Obj().Pkg()
+		if pkg == nil {
+			return false
+		}
+		if names, ok := terminatorFuncs[pkg.Path()]; ok {
+			_, found := names[name]
+			return found
+		}
+		return false
+	}
+
+	if callee.Package() == nil {
+		return false
+	}
+	pkg := callee.Package().Pkg
+	if pkg == nil {
+		return false
+	}
+	if names, ok := terminatorFuncs[pkg.Path()]; ok {
+		_, found := names[callee.Name()]
+		return found
+	}
 	return false
 }

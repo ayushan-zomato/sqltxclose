@@ -554,3 +554,373 @@ func badDeferClosureCondUnrelated(db *gorm.DB, a bool, unrelated bool) error {
 	}
 	return nil // want "transaction started here is not guaranteed"
 }
+
+// ── Tx reassignment ──
+
+// badTxReassign: first Begin is leaked when tx is reassigned.
+func badTxReassign(db *gorm.DB) error {
+	tx := db.Begin() // want "transaction started here is not guaranteed"
+	if tx.Error != nil {
+		return tx.Error
+	}
+	tx = db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer tx.Rollback()
+	return tx.Commit().Error
+}
+
+// badTxReassignLoop: only the last iteration's tx is closed by the defer.
+func badTxReassignLoop(db *gorm.DB, n int) error {
+	var tx *gorm.DB
+	for i := 0; i < n; i++ {
+		tx = db.Begin() // want "transaction started here is not guaranteed"
+		if tx.Error != nil {
+			return tx.Error
+		}
+	}
+	defer tx.Rollback()
+	return tx.Commit().Error
+}
+
+// ── Helper-commits (interprocedural) ──
+
+func commitViaHelper(tx *gorm.DB) error {
+	return tx.Commit().Error
+}
+
+func rollbackViaHelper(tx *gorm.DB) error {
+	return tx.Rollback().Error
+}
+
+// goodHelperCommits: tx passed to a helper that commits it.
+func goodHelperCommits(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return commitViaHelper(tx)
+}
+
+// goodHelperRollback: tx passed to a helper that rolls back.
+func goodHelperRollback(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return rollbackViaHelper(tx)
+}
+
+// badHelperNoClose: helper receives tx but never closes it.
+func helperNoClose(tx *gorm.DB) error {
+	_ = tx
+	return nil
+}
+
+func badHelperNoClose(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return helperNoClose(tx) // want "transaction started here is not guaranteed"
+}
+
+// badHelperPartialClose: helper closes tx only on one branch — the other
+// path returns without closing. Caller must get a diagnostic.
+func helperPartialClose(tx *gorm.DB, ok bool) error {
+	if ok {
+		return tx.Commit().Error
+	}
+	return nil
+}
+
+func badHelperPartialClose(db *gorm.DB, ok bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	return helperPartialClose(tx, ok) // want "transaction started here is not guaranteed"
+}
+
+// goodDeferRollbackDirectCommit: defer rolls back on error; direct Commit on success path.
+// The else branch does unrelated work (e.g. fire a goroutine) — no close there.
+func goodDeferRollbackDirectCommit(db *gorm.DB) (err error) {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		} else {
+			doSomething() // unrelated post-success work, no close
+		}
+	}()
+
+	if err = doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	return nil
+}
+
+// goodDisarmBoolNoDirectCommitYet: rollback guard set true, deferred rollback,
+// commit and disarm happen after conditional logic.
+func goodDisarmBoolNoDirectCommitYet(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	rollback = false
+	return nil
+}
+
+// goodDisarmBoolWithConditionalLogicBeforeCommit: conditional validation before commit;
+// rollback guard disarmed after commit.
+func goodDisarmBoolWithConditionalLogicBeforeCommit(db *gorm.DB, validate bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+
+	if validate {
+		if err := doSomething(); err != nil {
+			return err
+		}
+	}
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	rollback = false
+	return nil
+}
+
+// goodDisarmBoolCommitWithErrorCheck: commit result is checked; rollback=false
+// is in the block after the error check, not the same block as Commit.
+func goodDisarmBoolCommitWithErrorCheck(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	rollback = false
+	return nil
+}
+
+// goodDisarmBoolNoExplicitDisarm: rollback guard initialized true, direct Commit,
+// no explicit rollback=false. The analyzer accepts this — the Commit IS a close.
+// Note: in production this causes a double-close (defer Rollbacks after Commit)
+// which is a logic bug but not a tx-leak.
+func goodDisarmBoolNoExplicitDisarm(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	return nil
+}
+
+// goodInvertedBoolGuard: committed=false init, defer rolls back when !committed,
+// committed=true set after commit.
+func goodInvertedBoolGuard(db *gorm.DB) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	if err := doSomething(); err != nil {
+		return err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// goodConditionalBeginWithFalseInitGuard: rollback guard starts false, set true
+// only if Begin succeeds, defer registered inside the conditional block.
+func goodConditionalBeginWithFalseInitGuard(db *gorm.DB, condition bool) error {
+	var tx *gorm.DB
+	rollback := false
+	if condition {
+		tx = db.Begin()
+		if tx.Error != nil {
+			return tx.Error
+		}
+		rollback = true
+		defer func() {
+			if rollback {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	if tx != nil {
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		rollback = false
+	}
+	return nil
+}
+
+// goodCrossDockPattern: rollback=false init, set true after Begin succeeds,
+// defer registered inside conditional, disarmed with rollback=false after commit.
+func goodCrossDockPattern(db *gorm.DB, condition bool) error {
+	var tx *gorm.DB
+	rollback := false
+	if condition {
+		if doSomething() == nil {
+			tx = db.Begin()
+			if tx.Error != nil {
+				return tx.Error
+			}
+			rollback = true
+			defer func() {
+				if rollback {
+					tx.Rollback()
+				}
+			}()
+		}
+	}
+
+	if tx != nil {
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		rollback = false
+	}
+	return nil
+}
+
+// goodCrossDockWithReturn: same pattern but with explicit return on Begin error.
+type crossDockReq struct{ err error }
+
+func (r *crossDockReq) goodCrossDockWithReturn(db *gorm.DB, condition bool) error {
+	var tx *gorm.DB
+	rollback := false
+	if condition {
+		tx = db.Begin()
+		if tx.Error != nil {
+			return tx.Error
+		}
+		rollback = true
+		defer func() {
+			if rollback {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	if tx != nil {
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		rollback = false
+	}
+	return nil
+}
+
+// goodCrossDockNoReturn: Begin error stored to a field instead of returned. Safe:
+// the early return after a failed Begin skips the commit, and once Begin succeeds
+// the armed deferred rollback covers every return before the commit.
+func (r *crossDockReq) goodCrossDockNoReturn(db *gorm.DB, condition bool) error {
+	var tx *gorm.DB
+	rollback := false
+	if condition {
+		tx = db.Begin()
+		if tx.Error != nil {
+			r.err = tx.Error // no return
+		} else {
+			rollback = true
+			defer func() {
+				if rollback {
+					tx.Rollback()
+				}
+			}()
+		}
+	}
+
+	if r.err != nil {
+		return r.err
+	}
+	if tx != nil {
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		rollback = false
+	}
+	return nil
+}
+
+// badCrossDockDisarmedWithoutClose: guard is disarmed with no close, so the early return leaks.
+func (r *crossDockReq) badCrossDockDisarmedWithoutClose(db *gorm.DB) error {
+	rollback := false
+	tx := db.Begin()
+	rollback = true
+	defer func() {
+		if rollback {
+			tx.Rollback()
+		}
+	}()
+	rollback = false
+	if r.err != nil {
+		return r.err // want "transaction started here is not guaranteed"
+	}
+	return tx.Commit().Error
+}
